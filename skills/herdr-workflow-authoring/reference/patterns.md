@@ -1,0 +1,140 @@
+# Composing agent() calls
+
+Deeper guidance for combining `agent()` / `parallel()` / `pipeline()` /
+`kind` / `machine` / the quality stdlib. Read this after `SKILL.md` once the
+basics aren't enough — none of this is required to write a working script.
+
+## `pipeline()` by default; `parallel()` only for a genuine barrier
+
+`pipeline(items, stage1, stage2, ...)` runs every item through all stages with
+**no barrier between stages** — item A can be in stage 2 while item B is still
+in stage 1. Wall-clock is the slowest single chain, not the sum of the
+slowest-per-stage. This is the default for any multi-stage fan-out.
+
+```js
+const results = await pipeline(
+  files,
+  (file) => agent(`Review ${file} for bugs.`, { label: `review:${file}`, schema: FINDINGS }),
+  (review, file) => agent(`Verify: ${JSON.stringify(review)}`, { label: `verify:${file}`, schema: VERDICT }),
+);
+```
+
+`parallel(thunks)` is a **barrier**: it awaits every thunk before returning
+anything. Reach for it only when stage N genuinely needs every stage-(N-1)
+result *together* — deduping across a full result set before expensive
+verification, or an early exit when a total count is zero. "I need to
+flatten/map/filter first" is not a reason to barrier: do the transform inside
+a pipeline stage instead. When unsure, use `pipeline`.
+
+## Loop until you have enough, not a fixed count
+
+For open-ended discovery (bugs, edge cases, missing coverage) a fixed
+`for` loop misses the tail. Either drive it yourself:
+
+```js
+const bugs = [];
+while (bugs.length < 10) {
+  const found = await agent("Find more bugs in this diff.", { schema: BUGS });
+  bugs.push(...(found?.bugs ?? []));
+}
+```
+
+or use `loopUntilDry`, which repeats rounds until N consecutive rounds
+surface nothing new — see the quality-stdlib table in `SKILL.md`.
+
+## Picking `kind` or `machine` per call inside a fan-out
+
+`kind` and `machine` are just fields in the `options` object each thunk
+builds, so a fan-out can vary either per call:
+
+```js
+// Same target, two independent lenses — see reference/second-opinion.js.
+const [correctness, maintainability] = await parallel(
+  ["correctness", "maintainability"].map((lens) => () =>
+    agent(`${prompt}\n\nReview lens: ${lens}`, { kind: "codex", label: `review:${lens}` }),
+  ),
+);
+```
+
+```js
+// Same prompt spread across every machine tagged "linux".
+const perMachine = await parallel(
+  linuxMachineNames.map((name) => () => agent(prompt, { machine: name, label: `run:${name}` })),
+);
+```
+
+Remember: naming a `machine` (or tag) that resolves to zero configured
+machines is a validation error, not a silent fallback to local — check
+`fleet.toml` first if you're about to name one you haven't seen there.
+
+## Adversarial verify, by hand
+
+`verify()` already does N-reviewer adversarial voting (see `SKILL.md`). Reach
+for the hand-rolled version only when you need a majority vote across
+*qualitatively different* lenses rather than N identical reviewers — e.g. one
+reviewer checking correctness, one checking security, one checking whether the
+fix actually reproduces the original failure:
+
+```js
+const lenses = ["correctness", "security", "reproduces the bug"];
+const votes = await parallel(
+  lenses.map((lens) => () =>
+    agent(`Judge via the ${lens} lens — is this real? Default to false if unsure.\n\n${claim}`, {
+      label: `verify:${lens}`,
+      schema: { type: "object", properties: { real: { type: "boolean" } }, required: ["real"] },
+    }),
+  ),
+);
+const survives = votes.filter(Boolean).filter((v) => v.real).length >= 2;
+```
+
+## No silent caps
+
+If a script bounds its own coverage — top-N results, no retry on failure,
+a sampled subset — `log()` what got dropped. A run that silently truncated
+its coverage looks identical, from the envelope, to one that covered
+everything.
+
+## Reading these examples
+
+Every file in this directory is runnable as-is:
+
+```bash
+herdr plugin action invoke herdrflow.engine.run -- \
+  "$PWD/skills/herdr-workflow-authoring/reference/<file>" \
+  --cwd "$PWD" --fleet "$PWD/skills/herdr-workflow-authoring/reference/luna.fleet.toml"
+```
+
+| File | Pattern |
+| --- | --- |
+| `hello-workflow.js` | Sequential `agent()` calls across `phase()`s, `schema` for structured output, falling back when an agent returns `null`. |
+| `second-opinion.js` | `parallel()` fan-out with two independent GPT-5.6 Luna review lenses, comparing structured results, and a reconciliation call only when they disagree. |
+| `quality-stdlib-hello.js` | `verify()` for adversarial fact-checking and `judgePanel()` for picking the best of several attempts. |
+| `fleet-hello.js` (use `fleet.example.toml`, not `luna.fleet.toml`) | Explicit `machine` placement — one Luna call local, one on a named remote fleet machine over ssh. |
+| `mattcopock.js` | A router agent classifies a request into a flow, then a whole external skill's instructions are inlined into the executing `agent()` call's prompt — see "Inlining a skill into a prompt" below. |
+
+## Inlining a skill into a prompt
+
+Every `agent()` call is a separate CLI process. It does not share this
+session's skills, subagents, or slash commands — whatever guidance a call
+needs has to be *in the prompt string*, not referenced by name. Two
+consequences:
+
+- **Don't write `"Use the /diagnosing-bugs skill."`** in a prompt. The
+  subagent CLI herdr starts (possibly a different vendor than whoever wrote
+  the workflow) has no such skill installed, and even if it did, invoking it
+  by name is a no-op outside the session that defines it.
+- **Paste the skill's actual body into the prompt instead**, verbatim, as a
+  template-literal constant, then reference that constant from the `agent()`
+  call: `` `${SOME_SKILL}\n\n---\n\nApply it to: ${request}` ``. The agent then
+  has the real instructions in front of it, not a name it can't resolve.
+
+`mattcopock.js` does this for three flows condensed from a
+`/ask-matt`-style skill router: a routing `agent()` call picks `diagnose` /
+`build` / `review` from the request, then the matching branch runs one
+`agent()` call whose prompt is that flow's full skill text plus the request.
+The `review` branch goes a step further: the underlying skill's own process
+is "spawn two sub-agents in parallel, then aggregate" — which is exactly what
+`parallel()` with two thunks does, so the herdr version reuses the shape from
+"Picking `kind` or `machine` per call inside a fan-out", above, instead of
+reinventing it.

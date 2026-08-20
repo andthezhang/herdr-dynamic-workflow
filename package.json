@@ -1,0 +1,53 @@
+{
+  "name": "herdr-dynamic-workflow",
+  "version": "0.1.0",
+  "description": "JavaScript workflows for orchestrating coding-agent CLIs in Herdr.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "herdr-plugin.toml",
+    "skills"
+  ],
+  "scripts": {
+    "test": "npm run check && npm run test:unit",
+    "test:unit": "tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "herdr",
+    "herdr-plugin",
+    "workflow",
+    "dynamic-workflows",
+    "orchestration",
+    "multi-agent",
+    "claude-code"
+  ],
+  "homepage": "https://github.com/andthezhang/herdr-dynamic-workflow#readme",
+  "bugs": {
+    "url": "https://github.com/andthezhang/herdr-dynamic-workflow/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andthezhang/herdr-dynamic-workflow.git"
+  },
+  "author": "Andy Zhang",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "acorn": "^8.16.0",
+    "ajv": "^8.17.0",
+    "smol-toml": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

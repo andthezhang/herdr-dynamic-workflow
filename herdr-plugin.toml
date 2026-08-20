@@ -1,0 +1,28 @@
+id = "herdrflow.engine"
+name = "Herdr Dynamic Workflow"
+version = "0.1.0"
+min_herdr_version = "0.8.1"
+description = "Run JavaScript workflows across coding-agent CLIs on local and SSH machines"
+platforms = ["linux", "macos"]
+
+# node is the runtime; the engine is TypeScript adapted from pi-dynamic-workflows.
+[[build]]
+command = ["npm", "ci"]
+
+[[build]]
+command = ["npm", "run", "build"]
+
+# Herdr appends arguments supplied after `--` to this manifest command:
+#   herdr plugin action invoke herdrflow.engine.run -- <workflow.js> [--cwd path] [--fleet fleet.toml]
+[[actions]]
+id = "run"
+title = "Run workflow"
+contexts = ["global"]
+command = ["node", "dist/plugin/run.js"]
+
+# With no --run argument, resume.js resumes the most recently written journal.
+[[actions]]
+id = "resume"
+title = "Resume last run"
+contexts = ["global"]
+command = ["node", "dist/plugin/resume.js"]
