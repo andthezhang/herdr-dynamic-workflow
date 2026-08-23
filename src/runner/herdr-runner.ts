@@ -2,11 +2,11 @@
  * HerdrAgentRunner: the WorkflowAgentRunner backend that runs each agent()
  * call as a real coding-agent CLI inside a Herdr pane, per
  * docs/herdr-runtime-support.md §1 and SPEC D11 topology (one workspace
- * per run PER MACHINE, one tab per agent call, one pane per tab, never split —
+ * per run PER DESTINATION, one tab per agent call, one pane per tab, never split —
  * a fresh headless worker session has ZERO panes, so there is nothing to
  * split from):
  *
- *   workspace.create (once per runner per machine, label `flow/<runId>`,
+ *   workspace.create (once per runner per destination, label `flow/<runId>`,
  *   focus:false; closed again in close()) -> tab.create in it per agent call
  *   (HERDR_FLOW_* env injected, focus:false, label = the agent's label so the
  *   tab list is the run's progress view; tab/pane ids taken from the
@@ -25,46 +25,31 @@
  *   "output_file_missing") -> tab.close in a finally (closing the tab closes
  *   its pane).
  *
- * M2 additions (SPEC D4/D12/D15): a call's model/tier/effort resolve through
- * fleet.toml's [runtime.<kind>] tables into agent.start args + tab env —
- * explicit values that cannot be resolved are SCRIPT_VALIDATION_ERROR before
- * any socket call; the resolved args/env are folded into the engine's call
- * hash via callIdentity(). Blocked calls follow the configured on_blocked
- * policy: "fail" tears down; "escalate" leaves the pane open, emits an
- * escalation record + persisted pointer, and fails recoverable with the
- * attach command.
+ * Launch flags (SPEC D4): the agent CLI's permission bypass is hardcoded per
+ * kind (claude `--dangerously-skip-permissions`, codex `--sandbox
+ * workspace-write --ask-for-approval never`), and a call's `model`/`effort`
+ * are passed through verbatim as `--model` / `--effort` for the CLI to accept
+ * or reject. The resulting args are folded into the engine's call hash via
+ * callIdentity(). Blocked calls follow the onBlocked policy: "fail" tears
+ * down; "escalate" leaves the pane open, emits an escalation record +
+ * persisted pointer, and fails recoverable with the attach command.
  *
- * M3 additions (SPEC D12/D13): PLACEMENT and REMOTE MACHINES. Every call is
- * placed on exactly one fleet machine before any Herdr traffic:
+ * Where a call runs (SPEC D13) is the call's `ssh` option and nothing else:
  *
- * - `machine: undefined` -> the machine of least current occupancy among
- *   machines that declare the call's kind (ties break in fleet declaration
- *   order, so the implicit single-machine fleet always places "local").
- * - `machine: "name"` / `{name}` -> exactly that machine; `{tag}` -> least
- *   occupied among machines carrying the tag. Naming an unconfigured
- *   machine/tag is SCRIPT_VALIDATION_ERROR, never a silent fallback (D12).
- * - Per-machine slots are enforced with a synchronous check-and-increment
- *   (no await between reading and reserving — SPEC D5's overshoot rule) and
- *   released in the call's finally. A blocked call that ESCALATES keeps its
- *   slot: the worker still holds its pane, and D15 says escalate does not
- *   free capacity.
- * - Each machine gets one HerdrTransport: local machines the NDJSON socket,
- *   remote machines the plain herdr CLI over ssh at the machine's declared
- *   absolute herdr_bin (D13, ssh-transport.ts). HERDR_FLOW_OUT for a remote
- *   call is a REMOTE path (under remoteStateDir, POSIX-joined) read back
- *   through the same transport; remote tabs default to the machine's declared
- *   repo path (basename-matched against the workflow's cwd, else the first
- *   declared repo), else the remote HOME.
- * - Worktree isolation (a call-site cwd) is NOT supported on remote machines
- *   in this milestone: requesting it with a placement that has no local
- *   candidate is SCRIPT_VALIDATION_ERROR — an explicit error, never a silent
- *   degrade.
- * - Hash identity (SPEC D6, engine side): the engine hashes the call's
- *   `machine` OPTION — the stable machine NAME (or {tag} selector) the script
- *   asked for, with an implicit placement hashing exactly as before M3 — so
- *   existing journals keep replaying and a dynamically-chosen machine never
- *   makes the same script hash differently between runs. This runner adds no
- *   machine data to callIdentity().
+ * - `ssh: undefined` -> the LOCAL Herdr session's NDJSON socket.
+ * - `ssh: "daxzy-mac"` -> that ssh destination (a Host from ~/.ssh/config, or
+ *   user@host) driven with the plain herdr CLI over ssh, whose binary is found
+ *   with a login-shell probe (ssh-transport.ts). There is no host inventory:
+ *   the ssh config already knows the hosts.
+ * - One HerdrTransport (and one run workspace) per destination, created on the
+ *   first call placed there. HERDR_FLOW_OUT for an ssh call is a REMOTE path
+ *   (under remoteStateDir, POSIX-joined) read back through the same transport;
+ *   ssh tabs open in the remote HOME, never a local path.
+ * - Worktree isolation (a call-site cwd) is NOT supported over ssh: the path
+ *   only exists on the engine's host, so combining it with `ssh` is
+ *   SCRIPT_VALIDATION_ERROR — an explicit error, never a silent degrade.
+ * - Hash identity (SPEC D6) is the engine's job: it hashes the call's `ssh`
+ *   option, and this runner adds no host data to callIdentity().
  *
  * Herdr failures are mapped onto the engine's error taxonomy — pre-classified
  * WorkflowErrors for Herdr's own codes, the engine's wrapError seam for
@@ -78,14 +63,6 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentCallIdentity, AgentRunOptions, WorkflowAgentRunner } from "../engine/agent-runner.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "../engine/errors.js";
-import {
-  defaultFleetConfig,
-  type FleetConfig,
-  type MachineConfig,
-  type OnBlockedPolicy,
-  type ResolvedRuntime,
-  resolveRuntime,
-} from "../fleet/config.js";
 import {
   buildEnv,
   buildRemoteEnv,
@@ -158,13 +135,13 @@ export function normalizeAgentKind(kind: string): string {
 
 /**
  * SINGLE SOURCE OF TRUTH for the broken-kind guard: rejects an unwaitable
- * kind wherever it arrives — call-site `kind`, an agentType's kind, the
- * runner/[defaults] default kind, or a fleet machine's declared `kinds` —
- * with a SCRIPT_VALIDATION_ERROR raised BEFORE any pane/socket work. Both
- * local and remote calls pass through here via resolveCallRuntime; config
- * routes are checked at runner construction. The kind is normalized the way
- * herdr's server normalizes it (normalizeAgentKind), so spellings herdr
- * accepts as cline ("Cline", "cline.exe") cannot bypass the guard.
+ * kind wherever it arrives — call-site `kind`, an agentType's kind, or the
+ * runner's default kind — with a SCRIPT_VALIDATION_ERROR raised BEFORE any
+ * pane/socket work. Both local and ssh calls pass through here via
+ * resolveStartArgs; the default kind is checked at runner construction. The
+ * kind is normalized the way herdr's server normalizes it
+ * (normalizeAgentKind), so spellings herdr accepts as cline ("Cline",
+ * "cline.exe") cannot bypass the guard.
  */
 export function assertWaitableKind(kind: string, where: string, agentLabel?: string): void {
   if (!UNWAITABLE_KINDS.has(normalizeAgentKind(kind))) return;
@@ -180,9 +157,51 @@ export function assertWaitableKind(kind: string, where: string, agentLabel?: str
 /** Default remote base dir for HERDR_FLOW_* paths (world-writable on macOS and Linux). */
 export const DEFAULT_REMOTE_STATE_DIR = "/tmp/herdr-flow";
 
+/** The agent CLI a call runs when neither the call nor the caller names one. */
+export const DEFAULT_KIND = "claude";
+
+/**
+ * Permission-bypass flags appended to agent.start for the kinds this engine
+ * drives headlessly. A workflow worker has no human at its pane, so a CLI that
+ * stops to ask for approval hangs until the prompt wait times out — these
+ * flags are the launch path, not a user setting.
+ *
+ * codex's pair is verified against `codex --help` after 0.147.0 dropped
+ * `--full-auto`. A kind that is not listed launches bare.
+ */
+const PERMISSION_FLAGS: Readonly<Record<string, readonly string[]>> = {
+  claude: ["--dangerously-skip-permissions"],
+  codex: ["--sandbox", "workspace-write", "--ask-for-approval", "never"],
+};
+
+/**
+ * Blocked-call policy (SPEC D15). "answer" exists in the vocabulary but is not
+ * implemented until Q8 (what produces the answer) is settled — auto-answering
+ * a permission prompt is the most dangerous thing this engine could do.
+ */
+export type OnBlockedPolicy = "fail" | "escalate";
+
+/**
+ * The agent.start args for one call: the kind's permission flags, then the
+ * script's own `model`/`effort` passed straight through for the CLI to accept
+ * or reject (SPEC D4 — this engine does not keep a table of vendor model
+ * names). `tier` is a coarse model name and resolves through `--model` too.
+ */
+export function buildStartArgs(
+  kind: string,
+  request: { model?: string; tier?: string; effort?: string },
+): string[] {
+  const args = [...(PERMISSION_FLAGS[normalizeAgentKind(kind)] ?? [])];
+  const model = request.model?.trim() || request.tier?.trim();
+  if (model) args.push("--model", model);
+  const effort = request.effort?.trim();
+  if (effort) args.push("--effort", effort);
+  return args;
+}
+
 export interface HerdrAgentRunnerOptions {
   /**
-   * Path to the WORKFLOW session's socket on the LOCAL machine, constructed
+   * Path to the WORKFLOW session's socket on the LOCAL host, constructed
    * explicitly by the caller. Never HERDR_SOCKET_PATH from the environment —
    * inside a Herdr pane that points at the user's own session (reference §7).
    */
@@ -197,10 +216,10 @@ export interface HerdrAgentRunnerOptions {
    */
   stateDir: string;
   /**
-   * Base dir for REMOTE run output files (SPEC Q11): the agent on a remote
-   * machine writes `<remoteStateDir>/<runId>/<callIndex>.json` on ITS host,
-   * harvested back over ssh. Default "/tmp/herdr-flow" — a path that exists
-   * and is writable on any Unix host without knowing its $TMPDIR.
+   * Base dir for REMOTE run output files (SPEC Q11): the agent on an ssh host
+   * writes `<remoteStateDir>/<runId>/<callIndex>.json` on ITS host, harvested
+   * back over ssh. Default "/tmp/herdr-flow" — a path that exists and is
+   * writable on any Unix host without knowing its $TMPDIR.
    */
   remoteStateDir?: string;
   /**
@@ -209,31 +228,34 @@ export interface HerdrAgentRunnerOptions {
    * workflow's own cwd) — without it tab.create falls back to the server
    * process's home directory, where the agent cannot see the project (and,
    * measured live, claude drifted into answering inline instead of honoring
-   * the output-file contract). Remote tabs never receive this local path:
-   * they default to the machine's declared repo, else the remote HOME.
+   * the output-file contract). ssh tabs never receive this local path: it
+   * names a directory on the wrong filesystem.
    */
   defaults: { kind: string; cwd?: string };
   /**
-   * Label for the run's workspace on every machine (SPEC D11) — the sidebar
-   * name a human sees. run.js passes the workflow's own name
-   * (`<meta.name> · <last-4-of-runId>`) so concurrent runs stay tellable
-   * apart while truncation keeps the name visible. Falls back to
-   * `flow/<runId>` when absent.
+   * Label for the run's workspace on every destination (SPEC D11) — the
+   * sidebar name a human sees. run.js passes `<meta.name> · <last-4-of-runId>`
+   * so concurrent runs stay tellable apart while truncation keeps the name
+   * visible. Falls back to `flow/<runId>` when absent.
    */
   workspaceLabel?: string;
   /**
-   * Fleet/runtime configuration (SPEC D4/D12/D15): the [runtime.<kind>]
-   * tables a call's model/tier/effort resolve through into agent.start args +
-   * tab env, the machine list placement draws from, and the on_blocked
-   * policy. Defaults to the implicit fleet (single local machine, empty
-   * runtime tables, on_blocked "fail").
+   * Leave the run's workspace and agent tabs in Herdr after close().
+   * Default false: each call's tab is closed when the call finishes, and
+   * close() tears down the workspace. Abort still frees the aborted tab.
    */
-  fleet?: FleetConfig;
+  keepWorkspace?: boolean;
+  /**
+   * What a blocked worker does (SPEC D15): "fail" (default) tears the pane
+   * down with the call; "escalate" leaves it open for a human and prints the
+   * attach command.
+   */
+  onBlocked?: OnBlockedPolicy;
   /**
    * The worker session's name, used both to print human-runnable commands
    * (`herdr --session <name> agent attach <agent>`) in escalation records and
-   * as the session driven on REMOTE machines. Defaults to the socket path's
-   * session directory name (~/.config/herdr/sessions/<NAME>/herdr.sock).
+   * as the session driven over ssh. Defaults to the socket path's session
+   * directory name (~/.config/herdr/sessions/<NAME>/herdr.sock).
    */
   session?: string;
   /**
@@ -242,19 +264,19 @@ export interface HerdrAgentRunnerOptions {
    * OWN default session — reachable with plain `herdr` and NOT with
    * `--session <name>` — while "worker" (the default) means the named worker
    * session at ~/.config/herdr/sessions/<session>/. Escalation attach
-   * commands for local machines depend on this: in "default" mode the
+   * commands for local calls depend on this: in "default" mode the
    * blocked pane is in the user's own session, so the printed command must
    * omit --session (a `herdr --session flow …` command would target a
-   * different — typically not even running — session). Remote machines are
+   * different — typically not even running — session). ssh hosts are
    * unaffected: they are always driven under the named worker session.
    */
   localSessionMode?: "default" | "worker";
   /**
-   * Test seam: build the transport for one fleet machine. Defaults to
-   * LocalHerdrTransport (socketPath) for local machines and SshHerdrTransport
-   * (machine.transport.ssh + machine.herdrBin + session) for remote ones.
+   * Test seam: build the transport for one destination — `undefined` for the
+   * local session, else the call's ssh target. Defaults to LocalHerdrTransport
+   * (socketPath) and SshHerdrTransport (target + session) respectively.
    */
-  transportFactory?: (machine: MachineConfig) => HerdrTransport;
+  transportFactory?: (ssh: string | undefined) => HerdrTransport;
   /** Per-request socket timeout for ordinary calls (ms). Default 30 000. */
   requestTimeoutMs?: number;
   /** Default agent.prompt wait timeout when the call carries none (ms). Default 900 000. */
@@ -283,21 +305,20 @@ interface CallContext {
   label: string;
   runId: string;
   callIndex: number;
-  /** The fleet machine this call was placed on (SPEC D12). */
-  machine: MachineConfig;
-  /** True when the placed machine is reached over ssh (SPEC D13). */
-  remote: boolean;
+  /** The call's ssh target, or undefined for the local session (SPEC D13). */
+  ssh?: string;
   transport?: HerdrTransport;
   tabId?: string;
   paneId?: string;
   agentName?: string;
   /**
-   * Set when the on_blocked "escalate" policy claimed this call's tab: the
-   * blocked worker is deliberately left OPEN for a human, so the finally-block
-   * teardown must NOT close it — and the machine SLOT stays held, because the
-   * worker still occupies its pane (SPEC D15: escalate does not free capacity).
+   * Set when the "escalate" policy claimed this call's tab: the blocked worker
+   * is deliberately left OPEN for a human, so the finally-block teardown must
+   * NOT close it (SPEC D15).
    */
   escalated?: boolean;
+  /** Set when the call's AbortSignal fired; finally still closes the tab. */
+  aborted?: boolean;
 }
 
 const USAGE_ZERO = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
@@ -320,7 +341,8 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
   private readonly defaultKind: string;
   private readonly defaultCwd?: string;
   private readonly workspaceLabel?: string;
-  private readonly transportFactory?: (machine: MachineConfig) => HerdrTransport;
+  private readonly keepWorkspace: boolean;
+  private readonly transportFactory?: (ssh: string | undefined) => HerdrTransport;
   private readonly requestTimeoutMs: number;
   private readonly promptWaitTimeoutMs: number;
   private readonly agentStartTimeoutMs: number;
@@ -329,42 +351,24 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
   private readonly agentReadyPollMs: number;
   private readonly outputSettleMs: number;
   private readonly abortSettleMs: number;
-  private readonly fleet: FleetConfig;
   private readonly onBlocked: OnBlockedPolicy;
   /** Worker session name for human-runnable attach commands in escalations. */
   private readonly session: string;
   private readonly localSessionMode: "default" | "worker";
-  /** One transport per machine NAME, created lazily on first placement there. */
+  /** One transport per destination key, created lazily on the first call there. */
   private readonly transports = new Map<string, HerdrTransport>();
   /**
-   * Live occupancy per machine name (SPEC D12: capacity is declared, live
-   * occupancy is counted here). Incremented synchronously with the free-slot
-   * check — no await between reading and reserving — and decremented in each
-   * call's finally (except escalated calls, which keep holding — D15).
-   *
-   * KNOWN LIMITATION: this accounting is per ENGINE PROCESS, not per machine.
-   * The atomic check-and-increment that SPEC D5 requires cannot await a
-   * server-side agent count, so a fresh process (a resume while a previous
-   * execution's escalated panes still hold their slots, or two concurrent
-   * runs against one worker session) starts from zero and can oversubscribe a
-   * machine's DECLARED slots. Declared capacity is a per-run concurrency
-   * budget, not a cross-run admission controller.
+   * Blocked workers left open by the escalate policy, per destination. While a
+   * destination has any, close() must NOT close its workspace — the escalated
+   * panes live in it, and tearing it down would kill exactly the workers a
+   * human was told to go answer.
    */
-  private readonly occupancy = new Map<string, number>();
-  /** Callers parked until any machine releases a slot. */
-  private slotWaiters: Array<() => void> = [];
-  /**
-   * Blocked workers left open by the escalate policy, per machine name. While
-   * a machine has any, close() must NOT close that machine's workspace — the
-   * escalated panes live in it, and tearing it down would kill exactly the
-   * workers a human was told to go answer.
-   */
-  private readonly escalationsByMachine = new Map<string, number>();
+  private readonly escalations = new Map<string, number>();
   /** Monotonic across every run() on this runner: unique names and out paths. */
   private callSeq = 0;
   private readonly fallbackRunId = `r${Date.now().toString(36)}`;
   /**
-   * The run's ONE workspace per machine (SPEC D11), created lazily on the
+   * The run's ONE workspace per destination (SPEC D11), created lazily on the
    * first agent call placed there and memoized as a promise so concurrent
    * fan-out calls share a single workspace.create instead of racing to mint
    * one each. Reset on failure so a later call can retry; the resolved ids
@@ -404,6 +408,7 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     this.defaultKind = options.defaults.kind.trim();
     this.defaultCwd = options.defaults.cwd?.trim() || undefined;
     this.workspaceLabel = options.workspaceLabel?.trim() || undefined;
+    this.keepWorkspace = options.keepWorkspace === true;
     this.transportFactory = options.transportFactory;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.promptWaitTimeoutMs = options.promptWaitTimeoutMs ?? 900_000;
@@ -413,73 +418,53 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     this.agentReadyPollMs = options.agentReadyPollMs ?? 100;
     this.outputSettleMs = options.outputSettleMs ?? 1_500;
     this.abortSettleMs = options.abortSettleMs ?? 250;
-    this.fleet = options.fleet ?? defaultFleetConfig();
-    this.onBlocked = this.fleet.defaults.onBlocked;
+    this.onBlocked = options.onBlocked ?? "fail";
     this.session = options.session?.trim() || path.basename(path.dirname(options.socketPath));
     this.localSessionMode = options.localSessionMode ?? "worker";
-    // Broken-kind guard, config routes (call routes are guarded in
-    // resolveCallRuntime): the default kind (runner option, --kind, or the
-    // fleet's [defaults].kind — run.js folds them into defaults.kind) and
-    // every fleet machine's declared `kinds` fail fast at construction,
-    // before any pane/socket work.
+    // Broken-kind guard, config route (call routes are guarded in
+    // resolveStartArgs): the default kind (runner option, --kind, or the
+    // invoke object's kind — the plugin entry points fold them into
+    // defaults.kind) fails fast at construction, before any pane/socket work.
     assertWaitableKind(this.defaultKind, "default agent kind");
-    for (const machine of this.fleet.machines) {
-      for (const declared of machine.kinds ?? []) {
-        assertWaitableKind(declared, `fleet machine "${machine.name}" declared kinds`);
-      }
-    }
   }
 
   /**
-   * Runner-provided identity data (SPEC D4/D6): the RESOLVED runtime
-   * args/env this call's kind/model/tier/effort map to under the fleet
-   * config, folded into the engine's call hash so editing (say)
-   * `[runtime.claude].model.opus` invalidates the cached calls that used it.
-   * Throws SCRIPT_VALIDATION_ERROR for explicit values the config cannot
-   * resolve (before any socket call — the engine hashes before it runs).
+   * Runner-provided identity data (SPEC D4/D6): the agent.start args this
+   * call's kind/model/tier/effort produce, folded into the engine's call hash
+   * so a change to the launch flags invalidates the cached calls that used
+   * them. Throws SCRIPT_VALIDATION_ERROR for an unwaitable kind (before any
+   * socket call — the engine hashes before it runs).
    *
    * A call that names NO kind additionally contributes the runner's DEFAULT
-   * kind (SPEC D6: identity is {machine, kind} plus the resolved flags). The
-   * engine hashes only the script-visible kind (call site / agentType), so
-   * without this the CLI that actually runs an implicit-kind call would be
-   * invisible to the resume hash — resuming under a different default kind
-   * (`resume.js --kind codex`, or a changed [defaults].kind /
-   * HerdrAgentRunnerOptions.defaults.kind) would silently replay one CLI's
-   * result as the other's.
+   * kind (SPEC D6: identity is the kind plus the resolved flags). The engine
+   * hashes only the script-visible kind (call site / agentType), so without
+   * this the CLI that actually runs an implicit-kind call would be invisible to
+   * the resume hash — resuming under a different default kind (`resume.js
+   * --kind codex`, or a changed HerdrAgentRunnerOptions.defaults.kind) would
+   * silently replay one CLI's result as the other's.
    *
-   * Returns undefined when nothing resolves AND the call carries its own
-   * kind — the hash then matches the pre-fleet format byte for byte, so
-   * journals written without fleet config keep replaying for explicit-kind
-   * calls.
-   *
-   * Machine identity is deliberately NOT contributed here (SPEC D6): the
-   * engine already hashes the call's `machine` option — the stable machine
-   * NAME (or selector) the script asked for — and an implicit placement must
-   * keep hashing exactly as it did before multi-machine landed, or every
-   * pre-M3 journal would stop replaying.
+   * Host identity is deliberately NOT contributed here (SPEC D6): the engine
+   * already hashes the call's `ssh` option.
    */
   callIdentity(call: AgentCallIdentity): unknown {
-    const resolved = this.resolveCallRuntime(call, undefined);
+    const args = this.resolveStartArgs(call, undefined);
     const identity: Record<string, unknown> = {};
     if (!call.kind?.trim()) identity.kind = this.defaultKind;
-    if (resolved.args.length > 0 || Object.keys(resolved.env).length > 0) {
-      identity.args = resolved.args;
-      identity.env = resolved.env;
-    }
+    if (args.length > 0) identity.args = args;
     return Object.keys(identity).length === 0 ? undefined : identity;
   }
 
-  /** Resolve a call's runtime args/env through the fleet config (SPEC D4). */
-  private resolveCallRuntime(
+  /** The call's agent.start args, guarding the kind on the way through. */
+  private resolveStartArgs(
     call: { kind?: string; model?: string; tier?: string; effort?: string },
     agentLabel: string | undefined,
-  ): ResolvedRuntime {
+  ): string[] {
     const kind = call.kind?.trim() || this.defaultKind;
-    // Broken-kind guard, call routes: every call — local or remote, hashed via
-    // callIdentity or executed via run() — resolves its runtime here first,
-    // before any placement, slot, or socket work.
+    // Broken-kind guard, call routes: every call — local or over ssh, hashed
+    // via callIdentity or executed via run() — builds its args here first,
+    // before any transport or socket work.
     assertWaitableKind(kind, agentLabel ? `agent "${agentLabel}"` : "agent call", agentLabel);
-    return resolveRuntime(this.fleet, kind, { model: call.model, tier: call.tier, effort: call.effort }, agentLabel);
+    return buildStartArgs(kind, call);
   }
 
   async run(prompt: string, options: AgentRunOptions = {}): Promise<unknown> {
@@ -488,42 +473,34 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     this.throwIfAborted(signal, label);
 
     const kind = options.kind?.trim() || this.defaultKind;
-    // Resolve model/tier/effort through [runtime.<kind>] into agent.start args
-    // + tab env (SPEC D4). Throws SCRIPT_VALIDATION_ERROR for explicit values
-    // the fleet config cannot resolve — before any socket call; absent
-    // implicit values inherit silently. The same resolution feeds
-    // callIdentity(), so these args/env are already part of the engine's call
-    // hash when the engine drives this runner.
-    const runtime = this.resolveCallRuntime(
+    // The kind's permission flags plus the script's model/effort (SPEC D4).
+    // The same call feeds callIdentity(), so these args are already part of
+    // the engine's call hash when the engine drives this runner.
+    const startArgs = this.resolveStartArgs(
       { kind, model: options.model, tier: options.tier, effort: options.effort },
       label,
     );
-    // Placement candidates (SPEC D12): validated BEFORE any slot is reserved
-    // or transport touched, so a bad machine/tag never holds capacity.
-    const candidates = this.resolvePlacementCandidates(options.machine, kind, label, options.cwd);
+    // Where the call runs: validated BEFORE any transport is built, so a bad
+    // ssh option never opens a connection.
+    const ssh = this.resolveSshTarget(options, label);
     const runId = runIdFromSessionName(options.sessionName) ?? this.fallbackRunId;
     const callIndex = this.callSeq++;
 
-    // Reserve one slot on the least-occupied candidate (waits when every
-    // candidate is at declared capacity; released in the finally below).
-    const machine = await this.acquireMachine(candidates, signal, label);
-    const remote = machine.transport !== "local";
     const context: CallContext = {
       label,
       runId,
       callIndex,
-      machine,
-      remote,
+      ...(ssh !== undefined ? { ssh } : {}),
       agentName: buildAgentName(runId, callIndex),
     };
     try {
-      const transport = this.transportFor(machine);
+      const transport = this.transportFor(ssh);
       context.transport = transport;
       const hasSchema = options.schema != null;
-      // HERDR_FLOW_* paths live on the WORKER's machine (SPEC Q11): local
-      // calls under stateDir, remote calls under remoteStateDir (POSIX
-      // paths), both prepared through the machine's own transport.
-      const env = remote
+      // HERDR_FLOW_* paths live on the WORKER's host (SPEC Q11): local calls
+      // under stateDir, ssh calls under remoteStateDir (POSIX paths), both
+      // prepared through that host's own transport.
+      const env = ssh
         ? buildRemoteEnv(this.remoteStateDir, runId, callIndex, hasSchema)
         : buildEnv(this.stateDir, runId, callIndex, hasSchema);
       // TRUNCATE the out path (creating its parent dirs in the same round
@@ -541,10 +518,10 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
         await transport.writeTextFile(env.HERDR_FLOW_SCHEMA, JSON.stringify(options.schema, null, 2));
       }
 
-      const opened = await this.openTab(context, env, runtime.env, options, signal);
+      const opened = await this.openTab(context, env, options, signal);
       context.tabId = opened.tabId;
       context.paneId = opened.paneId;
-      await this.startAgent(context, kind, runtime.args, signal);
+      await this.startAgent(context, kind, startArgs, signal);
       const status = await this.promptAgent(context, prompt, options, signal);
       if (status === "blocked") throw await this.raiseBlocked(context, options);
       const value = await this.harvest(env.HERDR_FLOW_OUT, context, options);
@@ -557,10 +534,11 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
         // Cancellation is best-effort keystrokes (§8): esc to stop the turn,
         // a brief settle, ctrl+c to kill the CLI. tab.close in the finally
         // below then actually frees the tab and its pane. An explicit abort
-        // outranks an escalation: the user asked for teardown.
+        // outranks both escalate and keepWorkspace: the user asked for teardown.
+        context.aborted = true;
         if (context.escalated) {
           context.escalated = false;
-          this.releaseEscalation(machine.name);
+          this.releaseEscalation(destinationKey(ssh));
         }
         if (context.paneId) await this.abortTeardown(context);
         throw new WorkflowError(`agent "${label}" aborted`, WorkflowErrorCode.WORKFLOW_ABORTED, {
@@ -571,36 +549,37 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
       throw this.mapError(error, context);
     } finally {
       // Escalated blocked calls keep their tab (and pane, and agent) alive for
-      // the human the escalation points at — SPEC D15 — and keep their machine
-      // slot, because the worker still occupies the pane.
-      if (context.tabId && !context.escalated && context.transport) {
+      // the human the escalation points at — SPEC D15. keepWorkspace does the
+      // same for finished tabs (so a review workspace is not empty), except
+      // abort still tears the cancelled tab down.
+      const keepTab = context.escalated || (this.keepWorkspace && !context.aborted);
+      if (context.tabId && !keepTab && context.transport) {
         await this.closeTab(context.transport, context.tabId);
       }
-      if (!context.escalated) this.releaseMachine(machine.name);
     }
   }
 
   /**
-   * Close each machine's run workspace (tearing down any leftover tabs/panes
-   * with it) and then every transport. Idempotent; workspace teardown is
-   * best-effort so a dead server never turns shutdown into a crash.
+   * Close each destination's run workspace (tearing down any leftover
+   * tabs/panes with it) and then every transport. Idempotent; workspace
+   * teardown is best-effort so a dead server never turns shutdown into a crash.
    *
-   * EXCEPT for machines where the escalate policy left blocked workers open:
-   * their tabs live in that machine's workspace, and closing it would kill
-   * exactly the panes the escalation records told a human to go attach to
-   * (SPEC D15). Those workspaces are left alive (only the transports close —
-   * which severs no panes) and remain findable by their workspace label
-   * (the caller's workspaceLabel, else `flow/<runId>`).
+   * EXCEPT for destinations where the escalate policy left blocked workers
+   * open, or when keepWorkspace is set: those tabs live in that destination's
+   * workspace, and closing it would kill exactly the panes a human was told to
+   * keep (SPEC D15, keepWorkspace). Those workspaces are left alive (only the
+   * transports close — which severs no panes) and remain findable by their
+   * workspace label (the caller's workspaceLabel, else `flow/<runId>`).
    */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     try {
-      for (const [machineName, promise] of this.workspacePromises) {
-        if ((this.escalationsByMachine.get(machineName) ?? 0) > 0) continue;
-        const transport = this.transports.get(machineName);
+      for (const [key, promise] of this.workspacePromises) {
+        if (this.keepWorkspace || (this.escalations.get(key) ?? 0) > 0) continue;
+        const transport = this.transports.get(key);
         if (!transport) continue;
-        const workspaceId = this.workspaceIds.get(machineName) ?? (await promise.catch(() => undefined));
+        const workspaceId = this.workspaceIds.get(key) ?? (await promise.catch(() => undefined));
         if (workspaceId) await this.closeWorkspace(transport, workspaceId);
       }
     } catch {
@@ -616,216 +595,73 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     }
   }
 
-  // ── Placement (SPEC D12): machine selection and slot accounting ────────────
+  // ── Destination (SPEC D13): local socket or one ssh host ───────────────────
 
   /**
-   * Resolve a call's `machine:` option to its candidate machines, validating
-   * strictly (naming an unconfigured machine or tag is SCRIPT_VALIDATION_ERROR,
-   * never a silent fallback — SPEC D12):
+   * The call's ssh target, or undefined for the local session. `ssh` is an
+   * ssh Host name — an alias from ~/.ssh/config, or user@host — and nothing
+   * else: there is no inventory to look it up in, so a blank one is an author
+   * error rather than a silent fall back to local.
    *
-   * - undefined       -> every machine that declares the kind
-   * - "name" / {name} -> exactly that machine (which must declare the kind)
-   * - {tag}           -> the machines carrying that tag that declare the kind
-   *
-   * A call-site cwd (worktree isolation) narrows candidates to LOCAL machines:
-   * the path only exists on the engine's host, and this milestone does not
-   * ship worktrees across ssh — a placement left with no local candidate is
-   * an explicit validation error, not a silent degrade.
+   * A call-site cwd (worktree isolation) cannot travel: the path only exists
+   * on the engine's host, so combining it with `ssh` is an explicit validation
+   * error, not a silent degrade.
    */
-  private resolvePlacementCandidates(
-    machineOption: AgentRunOptions["machine"],
-    kind: string,
-    label: string,
-    cwd: string | undefined,
-  ): MachineConfig[] {
-    const machines = this.fleet.machines;
-    const configured = machines.map((entry) => entry.name).join(", ");
+  private resolveSshTarget(options: AgentRunOptions, label: string): string | undefined {
     const fail = (message: string): never => {
       throw new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false, agentLabel: label });
     };
-    const source = this.fleet.source ? `fleet config: ${this.fleet.source}` : "no fleet.toml is configured";
-
-    let base: MachineConfig[];
-    let selector: string;
-    if (machineOption === undefined) {
-      base = machines;
-      selector = "any machine";
-    } else {
-      const record = typeof machineOption === "object" && machineOption !== null ? (machineOption as Record<string, unknown>) : undefined;
-      const name = typeof machineOption === "string" ? machineOption : typeof record?.name === "string" ? (record.name as string) : undefined;
-      const tag = typeof record?.tag === "string" ? (record.tag as string) : undefined;
-      if (name !== undefined) {
-        const found = machines.find((entry) => entry.name === name);
-        if (!found) {
-          fail(
-            `agent "${label}": machine "${name}" is not in the fleet (configured machines: ${configured}; ${source}). ` +
-              "Naming an unconfigured machine is a validation error, never a silent fallback to local (SPEC D12).",
-          );
-        }
-        base = [found!];
-        selector = `machine "${name}"`;
-      } else if (tag !== undefined) {
-        base = machines.filter((entry) => entry.tags.includes(tag));
-        if (base.length === 0) {
-          fail(
-            `agent "${label}": no fleet machine carries tag "${tag}" (configured machines: ${configured}; ${source}). ` +
-              "Naming an unconfigured tag is a validation error, never a silent fallback to local (SPEC D12).",
-          );
-        }
-        selector = `tag "${tag}"`;
-      } else {
-        return fail(
-          `agent "${label}": machine ${JSON.stringify(machineOption)} does not name a machine ` +
-            `(use a machine name string, {name: "..."}, or {tag: "..."}; configured machines: ${configured})`,
-        );
-      }
-    }
-
-    // A machine can only run kinds it declares (an omitted `kinds` declares no
-    // restriction — SPEC D12).
-    const kindEligible = base.filter((entry) => !entry.kinds || entry.kinds.includes(kind));
-    if (kindEligible.length === 0) {
-      fail(
-        `agent "${label}": no machine matching ${selector} declares kind "${kind}" ` +
-          `(considered: ${base.map((entry) => entry.name).join(", ")}; ${source})`,
+    if (options.ssh === undefined) return undefined;
+    const target = typeof options.ssh === "string" ? options.ssh.trim() : "";
+    if (!target) {
+      return fail(
+        `agent "${label}": ssh ${JSON.stringify(options.ssh)} is not a host name — pass the ssh Host ` +
+          "(an alias from ~/.ssh/config, or user@host), or omit ssh to run on this computer.",
       );
     }
-
-    // A machine can only work repos it has (SPEC D12): a REMOTE machine that
-    // declares `repos` is eligible only when one of them basename-matches the
-    // workflow's own cwd — the same match remoteCwd() uses to pick the remote
-    // tab's directory — because placing there would otherwise silently run
-    // the agent in an unrelated checkout (or HOME). An omitted/empty `repos`
-    // declares no restriction, mirroring `kinds`; local machines always
-    // qualify (the workflow's cwd is by definition on the engine's host); and
-    // with no workflow cwd there is no repo to require.
-    const wantedRepo = this.defaultCwd ? path.basename(this.defaultCwd) : undefined;
-    const repoEligible =
-      wantedRepo === undefined
-        ? kindEligible
-        : kindEligible.filter(
-            (entry) =>
-              entry.transport === "local" ||
-              entry.repos.length === 0 ||
-              entry.repos.some((repo) => path.posix.basename(repo) === wantedRepo),
-          );
-    if (repoEligible.length === 0) {
-      fail(
-        `agent "${label}": no machine matching ${selector} declares a repo matching "${wantedRepo}" ` +
-          `(a machine can only work repos it has — SPEC D12; considered: ` +
-          `${kindEligible.map((entry) => `${entry.name} [${entry.repos.join(", ") || "no repos"}]`).join("; ")}; ${source})`,
+    if (options.cwd !== undefined) {
+      return fail(
+        `agent "${label}": worktree isolation (a call-site cwd) is not supported over ssh — ` +
+          `${options.cwd} only exists on this computer. Drop the isolation or drop ssh: "${target}".`,
       );
     }
-
-    if (cwd === undefined) return repoEligible;
-    const local = repoEligible.filter((entry) => entry.transport === "local");
-    if (local.length === 0) {
-      fail(
-        `agent "${label}": worktree isolation (a call-site cwd) is not supported on remote machines in this ` +
-          `milestone, and ${selector} leaves no local machine to place it on (considered: ` +
-          `${repoEligible.map((entry) => entry.name).join(", ")}). Drop the isolation or place the call locally.`,
-      );
-    }
-    return local;
+    return target;
   }
 
-  /**
-   * Reserve one slot on the least-occupied candidate. The free-slot check and
-   * the increment are SYNCHRONOUS (no await between them — SPEC D5's atomic
-   * check-and-increment rule), so a parallel() fan-out can never overshoot a
-   * machine's declared slots. Ties break in fleet declaration order, keeping
-   * single-machine (and quiet multi-machine) placement deterministic. When
-   * every candidate is at capacity the call parks until any slot releases.
-   */
-  private async acquireMachine(candidates: MachineConfig[], signal: AbortSignal | undefined, label: string): Promise<MachineConfig> {
-    for (;;) {
-      this.throwIfAborted(signal, label);
-      let best: MachineConfig | undefined;
-      let bestCount = Infinity;
-      for (const machine of candidates) {
-        const used = this.occupancy.get(machine.name) ?? 0;
-        if (used >= (machine.slots ?? Infinity)) continue;
-        if (used < bestCount) {
-          best = machine;
-          bestCount = used;
-        }
-      }
-      if (best) {
-        this.occupancy.set(best.name, (this.occupancy.get(best.name) ?? 0) + 1);
-        return best;
-      }
-      await new Promise<void>((resolve) => {
-        const wake = (): void => {
-          signal?.removeEventListener("abort", wake);
-          resolve();
-        };
-        this.slotWaiters.push(wake);
-        signal?.addEventListener("abort", wake, { once: true });
-      });
-    }
+  private releaseEscalation(key: string): void {
+    const count = this.escalations.get(key) ?? 0;
+    this.escalations.set(key, Math.max(0, count - 1));
   }
 
-  private releaseMachine(machineName: string): void {
-    const used = this.occupancy.get(machineName) ?? 0;
-    this.occupancy.set(machineName, Math.max(0, used - 1));
-    const waiters = this.slotWaiters;
-    this.slotWaiters = [];
-    for (const wake of waiters) wake();
-  }
-
-  private releaseEscalation(machineName: string): void {
-    const count = this.escalationsByMachine.get(machineName) ?? 0;
-    this.escalationsByMachine.set(machineName, Math.max(0, count - 1));
-  }
-
-  /** The machine's transport, created on first placement there (SPEC D13). */
-  private transportFor(machine: MachineConfig): HerdrTransport {
-    const existing = this.transports.get(machine.name);
+  /** The destination's transport, created on the first call there (SPEC D13). */
+  private transportFor(ssh: string | undefined): HerdrTransport {
+    const key = destinationKey(ssh);
+    const existing = this.transports.get(key);
     if (existing) return existing;
     const created = this.transportFactory
-      ? this.transportFactory(machine)
-      : machine.transport === "local"
+      ? this.transportFactory(ssh)
+      : ssh === undefined
         ? new LocalHerdrTransport({ socketPath: this.socketPath, defaultTimeoutMs: this.requestTimeoutMs })
         : new SshHerdrTransport({
-            target: machine.transport.ssh,
-            // Validated non-empty for remote machines at fleet-config load.
-            herdrBin: machine.herdrBin!,
+            target: ssh,
             session: this.session,
-            machineName: machine.name,
             requestTimeoutMs: this.requestTimeoutMs,
           });
-    this.transports.set(machine.name, created);
+    this.transports.set(key, created);
     return created;
   }
 
-  /**
-   * Working directory for a REMOTE call's tab: the machine's declared repo
-   * (basename-matched against the workflow's own cwd when both exist, else
-   * the machine's first declared repo), else undefined — the remote HOME.
-   * The engine's local default cwd is never sent across: it names a path on
-   * the wrong filesystem.
-   */
-  private remoteCwd(machine: MachineConfig): string | undefined {
-    if (machine.repos.length === 0) return undefined;
-    if (this.defaultCwd) {
-      const wanted = path.basename(this.defaultCwd);
-      const matched = machine.repos.find((repo) => path.posix.basename(repo) === wanted);
-      if (matched) return matched;
-    }
-    return machine.repos[0];
-  }
-
-  // ── Phase 1: topology (SPEC D11 — workspace per run per machine) ───────────
+  // ── Phase 1: topology (SPEC D11 — workspace per run per destination) ───────
 
   /**
-   * The run's single workspace ON THIS MACHINE, created once and shared by
+   * The run's single workspace ON THIS DESTINATION, created once and shared by
    * every call placed there. No per-call abort signal on purpose: the
    * workspace is a RUN-scoped resource, and cancelling it with the first
    * call's signal would fail every concurrent caller sharing the memoized
    * promise.
    */
-  private ensureWorkspace(machine: MachineConfig, transport: HerdrTransport, runId: string): Promise<string> {
-    const existing = this.workspacePromises.get(machine.name);
+  private ensureWorkspace(key: string, transport: HerdrTransport, runId: string): Promise<string> {
+    const existing = this.workspacePromises.get(key);
     if (existing) return existing;
     const created = transport
       .request(
@@ -833,7 +669,7 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
         // The sidebar label leads with the WORKFLOW's name when the caller
         // provided one (run.js: `<meta.name> · <last4>`); `flow/<runId>` is
         // the label for library users who set none. Same label on every
-        // machine, including remote workers.
+        // destination, including ssh workers.
         { label: this.workspaceLabel ?? `flow/${runId}`, focus: false },
         {
           timeoutMs: this.requestTimeoutMs,
@@ -858,39 +694,33 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
             { recoverable: true },
           );
         }
-        this.workspaceIds.set(machine.name, workspaceId);
+        this.workspaceIds.set(key, workspaceId);
         return workspaceId;
       });
     // Reset the memo on failure so a later call can retry, while every
     // caller of THIS attempt still sees the failure.
     created.catch(() => {
-      if (this.workspacePromises.get(machine.name) === created) this.workspacePromises.delete(machine.name);
+      if (this.workspacePromises.get(key) === created) this.workspacePromises.delete(key);
     });
-    this.workspacePromises.set(machine.name, created);
+    this.workspacePromises.set(key, created);
     return created;
   }
 
   private async openTab(
     context: CallContext,
     env: FlowCallEnv,
-    runtimeEnv: Record<string, string>,
     options: AgentRunOptions,
     signal?: AbortSignal,
   ): Promise<{ tabId: string; paneId: string }> {
     const transport = context.transport!;
-    const workspaceId = await this.ensureWorkspace(context.machine, transport, context.runId);
+    const workspaceId = await this.ensureWorkspace(destinationKey(context.ssh), transport, context.runId);
     this.throwIfAborted(signal, context.label);
-    // Resolved [runtime.<kind>] env (SPEC D4's second delivery mechanism —
-    // agent.start accepts no environment of its own, so effort-style settings
-    // ride on the tab, whose shell the agent inherits) merged under the
-    // HERDR_FLOW_* contract env, which always wins on a name collision.
-    const tabEnv: Record<string, string> = { ...runtimeEnv };
+    const tabEnv: Record<string, string> = {};
     for (const [key, value] of Object.entries(env)) if (value !== undefined) tabEnv[key] = value;
-    // Call-site cwd (an isolated worktree) wins on LOCAL placements;
-    // otherwise the runner default (the workflow's cwd). Remote placements
-    // resolve against the machine's declared repos instead — the local paths
-    // do not exist there. Never send a local path to a remote tab.
-    const cwd = context.remote ? this.remoteCwd(context.machine) : (options.cwd ?? this.defaultCwd);
+    // Call-site cwd (an isolated worktree) wins locally; otherwise the runner
+    // default (the workflow's cwd). An ssh tab gets NO cwd — it opens in the
+    // remote HOME, because every path we know names a directory on this host.
+    const cwd = context.ssh ? undefined : (options.cwd ?? this.defaultCwd);
     const result = (await transport.request(
       "tab.create",
       {
@@ -945,9 +775,9 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
             name,
             kind,
             pane_id: paneId,
-            // The resolved [runtime.<kind>] args (model/effort/permission,
-            // SPEC D4). Omitted entirely when empty, matching the schema's
-            // skip_serializing_if and keeping pre-fleet call shapes identical.
+            // The kind's permission flags plus --model/--effort (SPEC D4).
+            // Omitted entirely when empty, matching the schema's
+            // skip_serializing_if.
             ...(args.length > 0 ? { args } : {}),
             timeout_ms: this.agentStartTimeoutMs,
           },
@@ -1251,25 +1081,23 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
   }
 
   /**
-   * Apply the configured on_blocked policy (SPEC D15) to a call whose worker
-   * stopped to ask a human something. Both policies fail the call recoverable
-   * with the distinct HERDR_BLOCKED code; they differ in what happens to the
-   * pane, and `paneClosed` in the error's details always reflects reality:
+   * Apply the onBlocked policy (SPEC D15) to a call whose worker stopped to
+   * ask a human something. Both policies fail the call recoverable with the
+   * distinct HERDR_BLOCKED code; they differ in what happens to the pane, and
+   * `paneClosed` in the error's details always reflects reality:
    *
    * - "fail" (default): the run()-level finally tears the tab down (killing
    *   the blocked agent with its pane) before the caller sees this error, so
    *   `paneClosed: true` and the tab/pane ids are diagnostics only.
    * - "escalate": the tab is deliberately left OPEN (context.escalated
-   *   suppresses the finally teardown AND the slot release — the worker still
-   *   occupies its pane, D15 — and close() then leaves that machine's
-   *   workspace alive), an escalation record is emitted through onHistory,
-   *   a pointer is persisted at `<stateDir>/<runId>/escalation-<call>.json`
-   *   on the ENGINE's machine, and the error message carries the
-   *   human-runnable attach command — `herdr --session <session> agent attach
-   *   <agent>` locally, wrapped in `ssh -t <target> '…'` for a remote machine
-   *   (a fleet view is a printed command, not a screen — SPEC D16).
-   *
-   * ("answer" is rejected at config-load time — see fleet/config.ts.)
+   *   suppresses the finally teardown, and close() then leaves that
+   *   destination's workspace alive), an escalation record is emitted through
+   *   onHistory, a pointer is persisted at
+   *   `<stateDir>/<runId>/escalation-<call>.json` on the ENGINE's host, and
+   *   the error message carries the human-runnable attach command — `herdr
+   *   --session <session> agent attach <agent>` locally, wrapped in `ssh -t
+   *   <target> '…'` for an ssh worker (a view of other hosts is a printed
+   *   command, not a screen — SPEC D16).
    */
   private async raiseBlocked(
     context: CallContext,
@@ -1277,7 +1105,7 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     explanation?: string,
   ): Promise<HerdrWorkflowError> {
     const identity = {
-      machine: context.machine.name,
+      ...(context.ssh !== undefined ? { ssh: context.ssh } : {}),
       tabId: context.tabId,
       paneId: context.paneId,
       agentName: context.agentName,
@@ -1293,7 +1121,8 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     }
 
     context.escalated = true;
-    this.escalationsByMachine.set(context.machine.name, (this.escalationsByMachine.get(context.machine.name) ?? 0) + 1);
+    const key = destinationKey(context.ssh);
+    this.escalations.set(key, (this.escalations.get(key) ?? 0) + 1);
     const attachCommand = this.attachCommand(context);
     const escalation: Record<string, unknown> = {
       type: "escalation",
@@ -1302,7 +1131,7 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
       callIndex: context.callIndex,
       label: context.label,
       session: this.session,
-      workspaceId: this.workspaceIds.get(context.machine.name),
+      workspaceId: this.workspaceIds.get(key),
       attachCommand,
       ...identity,
     };
@@ -1321,16 +1150,14 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     options.onHistory?.([{ ...escalation }]);
     return new HerdrWorkflowError(
       `agent "${context.label}" is blocked on an approval/question prompt and was left OPEN for escalation ` +
-        `(agent ${context.agentName}, pane ${context.paneId}, machine ${context.machine.name}). Answer it with: ${attachCommand}`,
+        `(agent ${context.agentName}, pane ${context.paneId}, host ${context.ssh ?? "local"}). Answer it with: ${attachCommand}`,
       WorkflowErrorCode.AGENT_EXECUTION_ERROR,
       HERDR_BLOCKED,
       {
         // Recoverable (the run goes on; the call collapses to null) but NOT
-        // retryable: the escalated worker deliberately keeps its pane AND its
-        // machine slot (D15 — escalate does not free capacity), so an engine
-        // retry would open a duplicate worker for the same logical call and,
-        // on a machine at capacity, park forever waiting on the very slot
-        // this escalation holds — a deadlock, measured live.
+        // retryable: the escalated worker deliberately keeps its pane (D15),
+        // so an engine retry would open a duplicate worker for the same
+        // logical call while a human is still answering the first.
         recoverable: true,
         retryable: false,
         agentLabel: context.label,
@@ -1346,26 +1173,27 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
 
   /**
    * The human-runnable command that opens the blocked worker's pane (D16).
-   * Local machines: in "default" localSessionMode the pane lives in the
-   * user's OWN session, so the command must omit --session — with it, herdr
-   * would target the (typically not running) worker session and the printed
-   * escalation instruction would be unfollowable. Remote machines always run
-   * under the named worker session, mode or no mode.
+   * Local calls: in "default" localSessionMode the pane lives in the user's
+   * OWN session, so the command must omit --session — with it, herdr would
+   * target the (typically not running) worker session and the printed
+   * escalation instruction would be unfollowable. ssh workers always run under
+   * the named worker session, mode or no mode, and reach herdr through a login
+   * shell because plain `ssh host 'herdr …'` has no PATH (SPEC D13).
    */
   private attachCommand(context: CallContext): string {
-    if (context.machine.transport === "local") {
+    const attach = `agent attach ${context.agentName}`;
+    if (context.ssh === undefined) {
       return this.localSessionMode === "default"
-        ? `herdr agent attach ${context.agentName}`
-        : `herdr --session ${this.session} agent attach ${context.agentName}`;
+        ? `herdr ${attach}`
+        : `herdr --session ${this.session} ${attach}`;
     }
-    const remote = `${context.machine.herdrBin ?? "herdr"} --session ${this.session} agent attach ${context.agentName}`;
-    return `ssh -t ${context.machine.transport.ssh} ${shellQuote(remote)}`;
+    return `ssh -t ${context.ssh} ${shellQuote(`bash -lc ${shellQuote(`herdr --session ${this.session} ${attach}`)}`)}`;
   }
 
   /**
    * Poll for the output file for up to outputSettleMs after the wait
    * resolved — through the call's transport, because the file lives on the
-   * worker's machine (SPEC Q11).
+   * worker's host (SPEC Q11).
    */
   private async readOutputFile(transport: HerdrTransport, outPath: string): Promise<string | undefined> {
     const deadline = Date.now() + this.outputSettleMs;
@@ -1438,7 +1266,7 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     if (error instanceof WorkflowError) return error;
     if (error instanceof HerdrRpcError) {
       const details = {
-        machine: context.machine.name,
+        ...(context.ssh !== undefined ? { ssh: context.ssh } : {}),
         tabId: context.tabId,
         paneId: context.paneId,
         agentName: context.agentName,
@@ -1481,7 +1309,7 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
         case "agent_not_ready":
           // Placement-level failure, NOT a retryable agent error (reference §1
           // phase 2): the cause (e.g. a first-launch trust prompt) is
-          // deterministic per (machine, kind, repo), so an engine-level retry
+          // deterministic per (host, kind, repo), so an engine-level retry
           // replays it identically and a recoverable classification would then
           // silently collapse the call to null. Non-recoverable surfaces the
           // placement problem to the operator instead.
@@ -1509,6 +1337,11 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Map key for one destination's transport, workspace, and escalation count. */
+function destinationKey(ssh: string | undefined): string {
+  return ssh === undefined ? "local" : `ssh:${ssh}`;
 }
 
 /** Extract the engine's runId from `workflow:<runId> <label>` session names. */

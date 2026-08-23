@@ -3,10 +3,10 @@
  * (WorkflowAgentRunner.callIdentity) and the `effort` agent() option:
  * identity folded into the call hash only when present (absence hashes
  * byte-identically to the pre-seam format, so old journals keep replaying),
- * fleet-style config edits invalidating replay, callIdentity validation
- * errors surfacing pre-run, and effort threading/identity. Uses fake runners —
- * no Herdr socket involved; the socket-backed half lives in
- * herdr-runner-fleet.test.ts.
+ * changed launch flags invalidating replay, callIdentity validation errors
+ * surfacing pre-run, and effort threading/identity. Uses fake runners — no
+ * Herdr socket involved; the socket-backed half lives in
+ * herdr-runner-flags.test.ts.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -26,8 +26,8 @@ function collectingJournal(): { journal: Map<string, JournalEntry>; onAgentJourn
 }
 
 test("a journal from a runner WITHOUT callIdentity replays under one whose callIdentity returns undefined", async () => {
-  // "Absence of fleet config hashes as before": the seam must be invisible
-  // when it contributes nothing.
+  // A runner that contributes nothing hashes as before: the seam must be
+  // invisible when it is empty.
   const { journal, onAgentJournal } = collectingJournal();
   const legacyRunner: WorkflowAgentRunner = { run: async () => "legacy result" };
   await runWorkflow(SCRIPT, { agent: legacyRunner, persistLogs: false, runId: "seamrun", onAgentJournal });
@@ -82,7 +82,7 @@ test("a changed callIdentity value invalidates the cached call; an identical one
   assert.equal(replayed.result, "under v1 flags");
   assert.equal(same.runs, 0);
 
-  // Changed identity (a fleet config edit): live re-run.
+  // Changed identity (different resolved launch flags): live re-run.
   const changed = { runs: 0 };
   const rerun = await runWorkflow(SCRIPT, {
     agent: makeRunner({ args: ["--model", "opus-4.5"], env: {} }, "under v2 flags", changed),
@@ -135,9 +135,9 @@ test("a callIdentity SCRIPT_VALIDATION_ERROR halts the run before the runner eve
   assert.equal(ran, 0, "validation fires before any backend work — and is never retried");
 });
 
-// ─── machine identity (SPEC D6) ──────────────────────────────────────────────
+// ─── ssh identity (SPEC D6) ──────────────────────────────────────────────────
 
-test("the call's machine option is part of the resume hash: repointing invalidates the cached result (D6)", async () => {
+test("the call's ssh option is part of the resume hash: repointing invalidates the cached result (D6)", async () => {
   const { journal, onAgentJournal } = collectingJournal();
   const makeRunner = (result: string, counter: { runs: number }): WorkflowAgentRunner => ({
     run: async () => {
@@ -145,14 +145,14 @@ test("the call's machine option is part of the resume hash: repointing invalidat
       return result;
     },
   });
-  const script = (machine: string) => `export const meta = { name: 'm', description: 'machine identity' }
-return await agent('t', { label: 'w', machine: '${machine}' })`;
+  const script = (ssh: string) => `export const meta = { name: 'm', description: 'ssh identity' }
+return await agent('t', { label: 'w', ssh: '${ssh}' })`;
 
   const first = { runs: 0 };
   await runWorkflow(script("box-a"), { agent: makeRunner("made on box-a", first), persistLogs: false, runId: "seamrun", onAgentJournal });
   assert.equal(first.runs, 1);
 
-  // Same machine: replay.
+  // Same host: replay.
   const same = { runs: 0 };
   const replayed = await runWorkflow(script("box-a"), {
     agent: makeRunner("never seen", same),
@@ -162,7 +162,7 @@ return await agent('t', { label: 'w', machine: '${machine}' })`;
     resumeFromRunId: "seamrun",
   });
   assert.equal(replayed.result, "made on box-a");
-  assert.equal(same.runs, 0, "an unchanged machine must replay from the journal");
+  assert.equal(same.runs, 0, "an unchanged ssh host must replay from the journal");
 
   // Repointed: the cached result must NOT be replayed as box-b's.
   const moved = { runs: 0 };
@@ -174,10 +174,10 @@ return await agent('t', { label: 'w', machine: '${machine}' })`;
     resumeFromRunId: "seamrun",
   });
   assert.equal(rerun.result, "made on box-b");
-  assert.equal(moved.runs, 1, "repointing a call at a different machine must invalidate its cached result");
+  assert.equal(moved.runs, 1, "repointing a call at a different ssh host must invalidate its cached result");
 });
 
-test("an implicit placement (no machine option) hashes stably: pre-fleet journals keep replaying", async () => {
+test("a local call (no ssh option) hashes stably across runs", async () => {
   const { journal, onAgentJournal } = collectingJournal();
   let liveRuns = 0;
   const runner = (result: string): WorkflowAgentRunner => ({
@@ -195,7 +195,7 @@ test("an implicit placement (no machine option) hashes stably: pre-fleet journal
     resumeFromRunId: "seamrun",
   });
   assert.equal(replay.result, "implicit result");
-  assert.equal(liveRuns, 1, "an implicit placement must hash identically across runs");
+  assert.equal(liveRuns, 1, "a local call must hash identically across runs");
 });
 
 // ─── effort option ────────────────────────────────────────────────────────────

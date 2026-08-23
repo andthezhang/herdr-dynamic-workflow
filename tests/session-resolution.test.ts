@@ -42,7 +42,7 @@ test("zero-config: the user's own default session wins when its socket is connec
   const target = await resolveSessionTarget({}, { probe, spawnServer: (s) => spawned.push(s) });
   assert.deepEqual(target, { session: DEFAULT_WORKER_SESSION, socketPath: own, mode: "default" });
   // The worker session NAME stays "flow" even in default mode — remote
-  // machines and attach commands must never see a session named "default".
+  // ssh hosts and attach commands must never see a session named "default".
   assert.notEqual(target.session, "default");
   assert.deepEqual(probed, [own], "a connectable default session ends resolution");
   assert.deepEqual(spawned, [], "no autostart when the default session answers");
@@ -189,6 +189,10 @@ test("success envelope: agentCount + durationMs, and NO tokenUsage (herdr has no
   const resumed = successEnvelope("run-x", outcome, { resumed: true });
   assert.equal(resumed.resumed, true);
   assert.ok(!("tokenUsage" in resumed));
+  const kept = successEnvelope("run-x", outcome, { workspace: "PR 412 · ab12", kept: true });
+  assert.equal(kept.workspace, "PR 412 · ab12");
+  assert.equal(kept.kept, true);
+  assert.ok(!("tokenUsage" in kept));
 });
 
 test('the reserved session name "default" is rejected as a worker name (explicit --session and journal alike)', async () => {
@@ -196,7 +200,7 @@ test('the reserved session name "default" is rejected as a worker name (explicit
   // normalize_name -> the ~/.config/herdr/herdr.sock socket, NOT
   // sessions/default/): accepting it would poll a socket herdr never creates
   // while `herdr --session default server` binds the user's personal
-  // session — and remotely it would drive another machine's default session.
+  // session — and over ssh it would drive another host's default session.
   const { probe, probed } = fakeProbe(new Set());
   const spawned: string[] = [];
   const deps = { probe, spawnServer: (s: string) => spawned.push(s) };

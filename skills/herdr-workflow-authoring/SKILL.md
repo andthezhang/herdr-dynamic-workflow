@@ -1,6 +1,6 @@
 ---
 name: herdr-workflow-authoring
-description: Write and run a dynamic workflow on Herdr — a JS script whose agent() calls run real coding-agent CLIs (claude, codex, cursor, …) as subagents in Herdr panes, locally or on fleet machines over ssh. Use when asked to run a herdr workflow, fan a task out across subagents, pick which CLI or machine an agent call runs on, or resume an earlier run.
+description: Write and run a dynamic workflow on Herdr — a JS script whose agent() calls run real coding-agent CLIs (claude, codex, cursor, …) as subagents in Herdr panes, locally or on an ssh host. Use when asked to run a herdr workflow, fan a task out across subagents, pick which CLI or which computer an agent call runs on, or resume an earlier run.
 ---
 
 # Authoring a herdr workflow
@@ -9,8 +9,8 @@ A **workflow** is one JS file that orchestrates other coding-agent CLIs as
 subagents. It structures work that would otherwise overflow one agent's
 context or benefit from running several agents at once: fan a task out across
 files, get independent reviews from two different CLIs and reconcile them,
-run a design → implement → review pipeline, or place work on a specific
-machine in a fleet. Each `agent()` call in the script becomes a real CLI
+run a design → implement → review pipeline, or place work on an ssh host.
+Each `agent()` call in the script becomes a real CLI
 process (claude, codex, cursor, …) running in its own Herdr terminal pane; the
 script itself only orchestrates — it never edits files or runs shell commands
 directly.
@@ -18,40 +18,48 @@ directly.
 You write the script; Herdr runs it and reports back a result. Nothing about
 the *dialect* below is Herdr-specific — it is the same scripting model used by
 Claude Code's own `Workflow` tool. What's new here is two fields on every
-`agent()` call (`kind`, `machine`) that pick which CLI and which computer each
+`agent()` call (`kind`, `ssh`) that pick which CLI and which computer each
 call runs on, because unlike Claude Code's tool, a herdr workflow is not
 implicitly "more Claude."
 
 ## How a run starts
 
-```bash
-herdr plugin action invoke herdrflow.engine.run -- \
-  "$PWD/<script.js>" --cwd "$PWD" [--fleet "$PWD/fleet.toml"]
-```
-
-There is no separate "compile" step. Point the command at a `.js` file and it
-runs. Zero config: the run appears live in your own Herdr sidebar as a
-workspace named after the workflow (`<meta.name> · <last-4-of-run-id>`), one
-tab per `agent()` call, so you (or the user) can watch it happen. If your
-session is unreachable it falls back to a hidden `flow` worker session,
-autostarting that session's server; `--session <name>` forces a named worker
-session. On success you get back `{ result, agentCount, durationMs }` — no
-token numbers (see "budget", below).
-
-Resume a run that crashed, or one whose script you've since edited: unchanged
-calls replay instantly from the journal, and only the first changed/new call
-and everything after it runs live.
+The CLI takes one JSON object. Same fields as Claude Code's Workflow tool,
+plus `kind` / `session` / `cwd`. Write the script to a file, then pipe the
+object:
 
 ```bash
-herdr plugin action invoke herdrflow.engine.resume -- --run <runId>
+herdr-dynamic-workflow <<'JSON'
+{ "scriptPath": "review.js", "args": { "pr": 412 } }
+JSON
 ```
+
+`args` is real JSON on the object, not a stringified list. `ssh` is an
+`agent()` option in the script.
+
+There is no compile step. Zero config: the run appears live in your own
+Herdr sidebar as `<meta.name> · <last-4-of-run-id>`, one tab per `agent()`
+call. If your session is unreachable it falls back to a hidden `flow`
+worker session. On success you get back `{ result, agentCount, durationMs }`.
+No token numbers (see "budget", below).
+
+Resume with the same object:
+
+```bash
+herdr-dynamic-workflow <<'JSON'
+{ "scriptPath": "review.js", "resumeFromRunId": "run-mt5cpbpy-i2ab" }
+JSON
+```
+
+Unchanged `agent()` calls replay from the journal. The first edited or new
+call and everything after it runs live.
 
 Every worker is a real terminal, reachable while it runs:
 
 ```
 herdr --session flow                       # the worker session, when one is used
 herdr --session flow agent attach <name>   # one worker, in this terminal
-ssh -t <host> '<herdr_bin> --session flow' # a remote machine's workers
+ssh -t <host> 'bash -lc "herdr --session flow"' # an ssh host's workers
 ```
 
 ## The script contract
@@ -111,47 +119,34 @@ results from `parallel`/`pipeline`.
 ```js
 await agent(prompt, {
   kind,        // which CLI: "claude" | "codex" | "cursor" | ... — see below
-  machine,     // which computer: a name, a tag selector, or omitted — see below
+  ssh,         // which computer: an ssh Host name, or omitted for this one
   label,       // names this call in logs, the journal, and the Herdr pane tab
   schema,      // a plain JSON Schema object — turns the reply into structured
                // data instead of a string. Not a builder; the script never
                // imports anything, so this is a literal object.
-  model,       // explicit model override, resolved against fleet config
-  effort,      // explicit reasoning-effort override, resolved against fleet config
+  model,       // passed to the CLI as --model, verbatim (e.g. "opus")
+  effort,      // passed to the CLI as --effort, verbatim (e.g. "high")
   isolation,   // "worktree" — see "Isolation", below
 });
 ```
 
-## `kind` and `machine`: the two things Claude Code's dialect doesn't have
+## `kind` and `ssh`: the two things Claude Code's dialect doesn't have
 
 ```js
-const review = await agent("Review the diff.", { kind: "codex" });     // which CLI
-const built = await agent("Implement it.", { machine: "linux-box" });  // which computer
-const bench = await agent("Run the benchmarks.", { machine: { tag: "linux" } });
+const review = await agent("Review the diff.", { kind: "codex" });    // which CLI
+const built = await agent("Implement it.", { ssh: "linux-box" });     // which computer
 ```
 
-**Omit both by default** — defaults come from the fleet config's `[defaults]`
-and the run's `--kind` flag. `machine` accepts either a configured machine's
-`name`, or `{ tag: "..." }` to place on any machine carrying that tag; either
-form resolves to the least-occupied eligible machine when more than one
-qualifies.
+**Omit both by default** — kind defaults to `claude` (or the invoke object's
+`kind`), and omitting `ssh` runs the call on this computer. `ssh` is a Host
+name your ssh config already knows: an alias from `~/.ssh/config`, or
+`user@host`. There is no inventory file to declare it in, and no tag
+selectors — if `ssh <name>` works in your terminal, it works here.
 
-Machine names and tags come from `fleet.toml`, not from anywhere else — naming
-one that isn't configured there is a validation error, never a silent
-fallback to local. So before naming one, read the fleet a run will load
-automatically (unless `--fleet` points elsewhere):
-
-```bash
-cat "$(herdr plugin config-dir herdrflow.engine)/fleet.toml"
-```
-
-The same strictness covers `model` / `effort`: a value the fleet config can't
-resolve fails that specific call at validation time, before it touches any
-pane — non-recoverably, so the run dies there. (Scripts are dynamic, so there
-is no whole-script pass up front: agents started by earlier calls have
-already run by the time a later call fails validation.) And `kind: "cline"` —
-in any spelling herdr would accept as cline — is always rejected: herdr has no
-idle-detection rule for cline, so a wait on it could never resolve.
+`kind: "cline"` is always rejected, in any spelling herdr would accept as
+cline: herdr has no idle-detection rule for it, so the call could never
+finish. `model` and `effort` are handed to the CLI verbatim as `--model` /
+`--effort`, so the CLI — not this engine — decides whether a name is real.
 
 ## `budget` counts agent calls, never tokens or money
 
@@ -185,14 +180,14 @@ privileged about them, just reusable patterns so scripts don't hand-roll them:
 it's extra setup on top of a shared session. Here every call already gets its
 own pane, so a worktree is the marginal cost of one `git worktree add`. Use it
 whenever agents in the same `parallel()`/`pipeline()` write files — two agents
-editing one checkout is a data race the engine cannot fix. (Worktree isolation
-runs on local machines only.)
+editing one checkout is a data race the engine cannot fix. (A worktree only
+exists on this computer, so combining `isolation` with `ssh` is an error.)
 
 ## Where to go next
 
 - `reference/patterns.md` — composing `pipeline()`/`parallel()`/the quality
   stdlib for real tasks: when a barrier is actually justified, looping until
-  you have enough instead of a fixed count, varying `kind`/`machine` inside a
+  you have enough instead of a fixed count, varying `kind`/`ssh` inside a
   fan-out, hand-rolled adversarial verify, and how to inline an existing
   skill's instructions into an `agent()` prompt when the subagent CLI won't
   have that skill installed.

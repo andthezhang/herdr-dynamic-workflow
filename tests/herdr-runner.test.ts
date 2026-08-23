@@ -4,10 +4,9 @@
  * tab.create per call -> agent.start -> agent.prompt -> harvest -> tab.close;
  * workspace.close on runner.close()), pane-busy backoff, prompt-stalled
  * esc-retry, blocked, missing-output fallback, schema pass/noncompliance,
- * abort teardown, the fleet machine guard, the no-fleet resolution guard, and
- * the HERDR_SOCKET_PATH env trap. Fleet-config-driven behavior (resolved
- * args/env, on_blocked escalate, hash identity) lives in
- * herdr-runner-fleet.test.ts.
+ * abort teardown, the broken-kind guard, and the HERDR_SOCKET_PATH env trap.
+ * Launch flags, hash identity, and the onBlocked escalate policy live in
+ * herdr-runner-flags.test.ts; ssh placement in herdr-runner-remote.test.ts.
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -17,9 +16,10 @@ import path from "node:path";
 import test from "node:test";
 import { WorkflowError, WorkflowErrorCode } from "../src/engine/errors.js";
 import { runWorkflow } from "../src/engine/workflow.js";
-import { parseFleetToml } from "../src/fleet/config.js";
 import { OUTPUT_CONTRACT_PREAMBLE } from "../src/runner/contract.js";
 import { HERDR_BLOCKED, HerdrAgentRunner, HerdrWorkflowError, normalizeAgentKind } from "../src/runner/herdr-runner.js";
+import { SshHerdrTransport } from "../src/runner/ssh-transport.js";
+import { FakeRemoteMachine } from "./fake-ssh.js";
 import { MockHerdrServer } from "./mock-herdr-server.js";
 
 interface Harness {
@@ -330,7 +330,7 @@ test("agent_not_ready is a placement failure: non-recoverable and never retried 
       assert.equal(
         error.recoverable,
         false,
-        "placement failures are deterministic per (machine, kind, repo): recoverable would let the engine retry them identically and then null the call",
+        "placement failures are deterministic per (host, kind): recoverable would let the engine retry them identically and then null the call",
       );
       return true;
     });
@@ -691,34 +691,44 @@ test("abort: send_keys esc -> ctrl+c -> tab.close actually frees the tab", async
   }
 });
 
-test("a machine not in the fleet is a script-validation error before any socket call (SPEC D12)", async () => {
-  const harness = await startHarness();
+test("the ssh option selects the destination: a host name builds an ssh transport, its absence the local one", async () => {
+  const remote = new FakeRemoteMachine();
+  remote.onPrompt = (_args, machine) => {
+    const out = machine.lastTabEnv?.HERDR_FLOW_OUT;
+    assert.ok(out);
+    machine.files.set(out, JSON.stringify({ ok: true, result: "ran on linux-01" }));
+    return { status: "done" };
+  };
+  const placed: Array<string | undefined> = [];
+  const harness = await startHarness({
+    transportFactory: (ssh?: string) => {
+      placed.push(ssh);
+      return new SshHerdrTransport({
+        target: ssh ?? "unused",
+        session: "flow",
+        exec: remote.exec,
+        serverStartDelayMs: 1,
+        serverStartRetries: 5,
+      });
+    },
+  });
   const { server } = harness;
   try {
-    for (const machine of ["linux-01", { name: "linux-01" }] as Array<string | Record<string, unknown>>) {
-      await assert.rejects(harness.runner.run("anywhere", { label: "worker", machine }), (error: unknown) => {
-        assert.ok(error instanceof WorkflowError);
-        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
-        assert.equal(error.recoverable, false);
-        assert.match(error.message, /not in the fleet/i);
-        assert.match(error.message, /\blocal\b/, "the error lists the configured machines");
-        return true;
-      });
-    }
-    // A selector that names nothing is equally a validation error.
-    await assert.rejects(harness.runner.run("anywhere", { label: "worker", machine: {} }), (error: unknown) => {
-      assert.ok(error instanceof WorkflowError);
-      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
-      assert.match(error.message, /does not name a machine/i);
-      return true;
-    });
-    assert.equal(server.calls.length, 0, "rejected before touching the socket");
+    assert.equal(await harness.runner.run("anywhere", { label: "worker", ssh: "linux-01" }), "ran on linux-01");
+    assert.deepEqual(placed, ["linux-01"], "the factory receives the ssh Host name verbatim");
+    assert.equal(server.calls.length, 0, "an ssh call must not touch the local socket");
+  } finally {
+    await harness.close();
+  }
+});
 
-    // machine: "local" (string or selector) is accepted.
-    server.on("agent.prompt", writesResult("ran locally"));
-    assert.equal(await harness.runner.run("here", { label: "worker", machine: "local" }), "ran locally");
-    server.on("agent.prompt", writesResult("ran locally again"));
-    assert.equal(await harness.runner.run("here", { label: "worker", machine: { name: "local" } }), "ran locally again");
+test("omitting ssh keeps the call on the local socket", async () => {
+  const harness = await startHarness();
+  const { server } = harness;
+  server.on("agent.prompt", writesResult("ran locally"));
+  try {
+    assert.equal(await harness.runner.run("here", { label: "worker" }), "ran locally");
+    assert.ok(server.callsFor("tab.create").length >= 1);
   } finally {
     await harness.close();
   }
@@ -771,24 +781,24 @@ test("runner constructor rejects agentStartTimeoutMs outside Herdr's (3000, 3000
   }
 });
 
-test("explicit model with no fleet config is SCRIPT_VALIDATION_ERROR before any socket call (supersedes model_tier_not_applied)", async () => {
-  // SPEC D4: an option we can't resolve is a validation error, not a silent
-  // drop. With no fleet.toml there is no [runtime.<kind>] table, so an
-  // explicit model/tier/effort cannot resolve to anything — the old
-  // "run-anyway-with-a-diagnostic" path is gone.
+test("model/effort are passed straight through to agent.start — the runner keeps no vendor model table", async () => {
   const harness = await startHarness();
   const { server } = harness;
   try {
-    for (const request of [{ model: "opus" }, { tier: "small" }, { effort: "high" }]) {
-      await assert.rejects(harness.runner.run("task", { label: "worker", ...request }), (error: unknown) => {
-        assert.ok(error instanceof WorkflowError);
-        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
-        assert.equal(error.recoverable, false);
-        assert.match(error.message, /cannot be resolved/i);
-        return true;
-      });
-    }
-    assert.equal(server.calls.length, 0, "rejected before touching the socket");
+    server.on("agent.prompt", writesResult("claude opus"));
+    assert.equal(await harness.runner.run("task", { label: "worker", kind: "claude", model: "opus" }), "claude opus");
+    assert.deepEqual(server.callsFor("agent.start")[0]!.params.args, ["--dangerously-skip-permissions", "--model", "opus"]);
+
+    server.on("agent.prompt", writesResult("codex effort"));
+    assert.equal(await harness.runner.run("task", { label: "worker", effort: "high" }), "codex effort");
+    assert.deepEqual(server.callsFor("agent.start")[1]!.params.args, [
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "never",
+      "--effort",
+      "high",
+    ]);
   } finally {
     await harness.close();
   }
@@ -902,6 +912,43 @@ test("concurrent first calls race into ONE workspace.create, not one each", asyn
 
 // ── Workspace labels (workflow-named sidebars) ────────────────────────────────
 
+test("keepWorkspace leaves tabs and the workspace open after close()", async () => {
+  const harness = await startHarness({ keepWorkspace: true, workspaceLabel: "PR 412 reviews · ab12" });
+  const { server } = harness;
+  server.on("agent.prompt", writesResult("kept"));
+  try {
+    assert.equal(await harness.runner.run("review", { label: "reviewer" }), "kept");
+    assert.equal(server.callsFor("tab.close").length, 0, "--keep must not close the agent tab");
+    await harness.runner.close();
+    assert.equal(server.callsFor("workspace.close").length, 0, "--keep must not close the workspace");
+    assert.equal(server.callsFor("workspace.create")[0]!.params.label, "PR 412 reviews · ab12");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("keepWorkspace still closes the tab when the call is aborted", async () => {
+  const harness = await startHarness({ keepWorkspace: true });
+  const { server } = harness;
+  server.on("agent.prompt", () => new Promise(() => {}));
+  const controller = new AbortController();
+  try {
+    const pending = harness.runner.run("long task", { label: "worker", signal: controller.signal });
+    while (server.callsFor("agent.prompt").length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    controller.abort();
+    await assert.rejects(pending, (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+      return true;
+    });
+    assert.equal(server.callsFor("tab.close").length, 1, "abort still frees the cancelled tab");
+  } finally {
+    await harness.close();
+  }
+});
+
 test("workspaceLabel threads into workspace.create; absent -> the flow/<runId> fallback", async () => {
   const harness = await startHarness({ workspaceLabel: "auth_refactor · ab12" });
   const { server } = harness;
@@ -951,13 +998,7 @@ test("kind cline at the call site is rejected before ANY socket work (local)", a
   }
 });
 
-test("kind cline on a REMOTE placement is rejected before any transport is built", async () => {
-  const fleet = parseFleetToml(`
-[[machine]]
-name = "far"
-transport = "ssh://user@far"
-herdr_bin = "/usr/local/bin/herdr"
-`);
+test("kind cline on an ssh placement is rejected before any transport is built", async () => {
   const server = await MockHerdrServer.start();
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "herdr-flow-cline-"));
   let transportsBuilt = 0;
@@ -965,7 +1006,6 @@ herdr_bin = "/usr/local/bin/herdr"
     socketPath: server.socketPath,
     stateDir,
     defaults: { kind: "codex" },
-    fleet,
     transportFactory: () => {
       transportsBuilt++;
       throw new Error("transportFactory must never be reached for a rejected kind");
@@ -973,7 +1013,7 @@ herdr_bin = "/usr/local/bin/herdr"
   });
   try {
     await assert.rejects(
-      runner.run("task", { label: "remote-clined", kind: "cline", machine: "far" }),
+      runner.run("task", { label: "remote-clined", kind: "cline", ssh: "far" }),
       (error: unknown) =>
         error instanceof WorkflowError && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
     );
@@ -986,22 +1026,16 @@ herdr_bin = "/usr/local/bin/herdr"
   }
 });
 
-test("fleet-declared cline is rejected at construction: [defaults] kind and machine kinds", async () => {
+test("a cline DEFAULT kind is rejected at construction, before any pane work", async () => {
   const server = await MockHerdrServer.start();
-  const stateDir = mkdtempSync(path.join(os.tmpdir(), "herdr-flow-cline-fleet-"));
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "herdr-flow-cline-default-"));
   try {
-    // [defaults] kind = "cline" (run.js folds it into defaults.kind).
-    const defaultsFleet = parseFleetToml(`
-[defaults]
-kind = "cline"
-`);
     assert.throws(
       () =>
         new HerdrAgentRunner({
           socketPath: server.socketPath,
           stateDir,
-          defaults: { kind: defaultsFleet.defaults.kind },
-          fleet: defaultsFleet,
+          defaults: { kind: "cline" },
         }),
       (error: unknown) => {
         assert.ok(error instanceof WorkflowError);
@@ -1009,26 +1043,6 @@ kind = "cline"
         assert.match(error.message, /cline/);
         return true;
       },
-    );
-    // A [[machine]] declaring cline among its kinds is a config error too —
-    // this engine can never wait a cline turn to completion on any machine.
-    const machineFleet = parseFleetToml(`
-[[machine]]
-name = "local"
-kinds = ["claude", "cline"]
-`);
-    assert.throws(
-      () =>
-        new HerdrAgentRunner({
-          socketPath: server.socketPath,
-          stateDir,
-          defaults: { kind: "claude" },
-          fleet: machineFleet,
-        }),
-      (error: unknown) =>
-        error instanceof WorkflowError &&
-        error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR &&
-        /machine "local"/.test(error.message),
     );
   } finally {
     await server.close();

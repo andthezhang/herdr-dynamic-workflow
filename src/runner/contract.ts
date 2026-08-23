@@ -60,10 +60,10 @@ export function buildEnv(stateDir: string, runId: string, callIndex: number, has
 }
 
 /**
- * Build the HERDR_FLOW_* env for a call placed on a REMOTE machine (SPEC
+ * Build the HERDR_FLOW_* env for a call placed on an ssh host (SPEC
  * D12/D13): the paths live on the worker's host, so they are joined with
  * POSIX separators regardless of the engine's own platform, and read back
- * over the machine's transport (never the local filesystem — Q11).
+ * over that host's transport (never the local filesystem — Q11).
  */
 export function buildRemoteEnv(remoteStateDir: string, runId: string, callIndex: number, hasSchema: boolean): FlowCallEnv {
   return buildEnvWith(path.posix.join, remoteStateDir, runId, callIndex, hasSchema);

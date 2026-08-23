@@ -19,6 +19,7 @@ import {
   journalPath,
   loadJournal,
   newRunId,
+  formatWorkspaceLabel,
   parseArgs,
   resolveInvocationCwd,
   saveJournal,
@@ -173,6 +174,12 @@ test("parseArgs splits positionals from --name value flags and rejects missing v
     positionals: ["wf.js", "pos"],
     flags: new Map([["verbose", "true"]]),
   });
+});
+
+test("formatWorkspaceLabel leads with the caller name and suffixes last-4 of runId", () => {
+  assert.equal(formatWorkspaceLabel("PR 412 reviews", "run-mt5cpbpy-i2ab"), "PR 412 reviews · i2ab");
+  assert.equal(formatWorkspaceLabel("  hello\nworld  ", "run-xxxx-ab12"), "hello world · ab12");
+  assert.equal(formatWorkspaceLabel("   ", "run-xxxx-ab12"), "workflow · ab12");
 });
 
 test("resolveInvocationCwd prefers Herdr pane/workspace context and falls back safely", () => {

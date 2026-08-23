@@ -2,7 +2,7 @@ id = "herdrflow.engine"
 name = "Herdr Dynamic Workflow"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Run JavaScript workflows across coding-agent CLIs on local and SSH machines"
+description = "Run JavaScript workflows across coding-agent CLIs, here or over SSH"
 platforms = ["linux", "macos"]
 
 # node is the runtime; the engine is TypeScript adapted from pi-dynamic-workflows.
@@ -12,8 +12,14 @@ command = ["npm", "ci"]
 [[build]]
 command = ["npm", "run", "build"]
 
-# Herdr appends arguments supplied after `--` to this manifest command:
-#   herdr plugin action invoke herdrflow.engine.run -- <workflow.js> [--cwd path] [--fleet fleet.toml]
+# Puts herdr-dynamic-workflow next to the herdr binary so any terminal can run it.
+[[build]]
+command = ["sh", "scripts/install-cli.sh"]
+
+# herdr plugin action invoke cannot pass the JSON object on Herdr 0.8.x.
+# Use: herdr-dynamic-workflow <<'JSON'
+# { "scriptPath": "workflow.js" }
+# JSON
 [[actions]]
 id = "run"
 title = "Run workflow"

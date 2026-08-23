@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const PLUGIN_ID = "herdrflow.engine";
+
+function pluginRootFromListJson(json) {
+  let parsed;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error("herdr plugin list did not return JSON");
+  }
+  const plugins = parsed && parsed.result && parsed.result.plugins;
+  if (!Array.isArray(plugins) || plugins.length === 0) {
+    throw new Error(
+      `plugin ${PLUGIN_ID} is not installed. Run: herdr plugin install andthezhang/herdr-dynamic-workflow`,
+    );
+  }
+  const match = plugins.find((entry) => entry && entry.plugin_id === PLUGIN_ID);
+  const root = match && match.plugin_root;
+  if (typeof root !== "string" || root.trim() === "") {
+    throw new Error(`plugin ${PLUGIN_ID} has no plugin_root`);
+  }
+  return root;
+}
+
+function findHerdr() {
+  const sibling = path.join(path.dirname(process.argv[1]), "herdr");
+  if (fs.existsSync(sibling)) return sibling;
+  const which = spawnSync("herdr", ["--version"], { encoding: "utf8" });
+  if (which.status === 0) return "herdr";
+  throw new Error("herdr not found (install Herdr, then reinstall this plugin)");
+}
+
+let herdr;
+let root;
+try {
+  herdr = findHerdr();
+  const listed = spawnSync(herdr, ["plugin", "list", "--json", "--plugin", PLUGIN_ID], {
+    encoding: "utf8",
+  });
+  if (listed.status !== 0) {
+    process.stderr.write(listed.stderr || "herdr plugin list failed\n");
+    process.exit(listed.status === null ? 1 : listed.status);
+  }
+  root = pluginRootFromListJson(listed.stdout);
+} catch (error) {
+  process.stderr.write(`herdr-dynamic-workflow: ${error.message}\n`);
+  process.exit(1);
+}
+
+const entry = path.join(root, "dist", "plugin", "run.js");
+if (!fs.existsSync(entry)) {
+  process.stderr.write(`herdr-dynamic-workflow: missing ${entry} (rebuild the plugin)\n`);
+  process.exit(1);
+}
+
+const child = spawnSync(process.execPath, [entry, ...process.argv.slice(2)], { stdio: "inherit" });
+process.exit(child.status === null ? 1 : child.status);

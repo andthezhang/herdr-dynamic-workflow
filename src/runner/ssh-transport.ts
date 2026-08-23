@@ -1,7 +1,7 @@
 /**
- * SshHerdrTransport: drive a REMOTE machine's Herdr session with the plain
- * `herdr` CLI over ssh (SPEC D13 — "local machines use the socket; remote
- * machines use plain herdr over SSH").
+ * SshHerdrTransport: drive an ssh host's Herdr session with the plain `herdr`
+ * CLI over ssh (SPEC D13 — "omit ssh and the call uses the local socket; name
+ * an ssh Host and it uses plain herdr over SSH there").
  *
  * Ground rules, all measured against herdr 0.8.0 and its Rust source:
  *
@@ -18,8 +18,9 @@
  *   runs its own wait_for_named_agent readiness poll) — a superset of the
  *   socket's launch_pending behavior, so the runner's own agent.get readiness
  *   poll simply succeeds immediately afterwards.
- * - The herdr binary is the machine's DECLARED ABSOLUTE PATH, never PATH:
- *   `ssh host 'cmd'` runs a non-login shell with no usable PATH (D13).
+ * - The herdr binary is an ABSOLUTE PATH, never a non-login PATH lookup:
+ *   `ssh host 'cmd'` has no usable PATH (D13). A caller-declared path is used
+ *   as-is; otherwise the first request probes `bash -lc 'command -v herdr'`.
  * - HERDR_SOCKET_PATH / HERDR_CLIENT_SOCKET_PATH are explicitly unset in the
  *   remote command (`env -u`) so a stray remote environment can never point
  *   the CLI at the wrong session (reference §7).
@@ -88,12 +89,14 @@ export const MAX_REMOTE_COMMAND_BYTES = 128 * 1024 - 8 * 1024;
 export interface SshHerdrTransportOptions {
   /** ssh destination: an alias from ssh config or user@host. */
   target: string;
-  /** ABSOLUTE path of the herdr binary on the remote machine (D13: never PATH). */
-  herdrBin: string;
-  /** The worker session name on the remote machine. */
+  /**
+   * ABSOLUTE path of the herdr binary on the ssh host. Omitted (the normal
+   * case): probe with a login shell (`bash -lc 'command -v herdr'`) on first
+   * use — plain `ssh host 'herdr'` has no PATH (D13).
+   */
+  herdrBin?: string;
+  /** The worker session name on the ssh host. */
   session: string;
-  /** Machine name, for error messages. Defaults to the ssh target. */
-  machineName?: string;
   /** Injected ssh runner (tests fake this). Defaults to spawning `ssh`. */
   exec?: SshExecFn;
   /** Default per-request timeout (ms). Default 30 000. */
@@ -115,9 +118,10 @@ export interface SshHerdrTransportOptions {
 
 export class SshHerdrTransport implements HerdrTransport {
   private readonly target: string;
-  private readonly herdrBin: string;
+  private readonly declaredHerdrBin?: string;
+  private resolvedHerdrBin?: string;
+  private herdrBinPromise?: Promise<string>;
   private readonly session: string;
-  private readonly machineName: string;
   private readonly exec: SshExecFn;
   private readonly requestTimeoutMs: number;
   private readonly controlDir: string;
@@ -136,19 +140,20 @@ export class SshHerdrTransport implements HerdrTransport {
     if (typeof options?.target !== "string" || !options.target.trim()) {
       throw new TypeError("SshHerdrTransport requires an ssh target (alias or user@host).");
     }
-    if (typeof options.herdrBin !== "string" || !path.isAbsolute(options.herdrBin.trim())) {
-      throw new TypeError(
-        `SshHerdrTransport requires an ABSOLUTE herdr_bin path (got ${JSON.stringify(options.herdrBin)}) — ` +
-          "ssh runs a non-login shell with no usable PATH (SPEC D13).",
-      );
+    if (options.herdrBin !== undefined && options.herdrBin.trim() !== "") {
+      if (!path.isAbsolute(options.herdrBin.trim())) {
+        throw new TypeError(
+          `SshHerdrTransport requires an ABSOLUTE herdrBin path (got ${JSON.stringify(options.herdrBin)}) — ` +
+            "ssh runs a non-login shell with no usable PATH (SPEC D13).",
+        );
+      }
+      this.declaredHerdrBin = options.herdrBin.trim();
     }
     if (typeof options.session !== "string" || !options.session.trim()) {
       throw new TypeError("SshHerdrTransport requires the worker session name.");
     }
     this.target = options.target.trim();
-    this.herdrBin = options.herdrBin.trim();
     this.session = options.session.trim();
-    this.machineName = options.machineName?.trim() || this.target;
     this.exec = options.exec ?? createDefaultSshExec();
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.controlDir = options.controlDir ?? path.join(os.homedir(), ".ssh", "herdr-flow");
@@ -165,6 +170,7 @@ export class SshHerdrTransport implements HerdrTransport {
 
   async request(method: string, params: Record<string, unknown> = {}, options: HerdrTransportRequestOptions = {}): Promise<unknown> {
     if (this.closed) throw new HerdrTransportError("ssh herdr transport is closed");
+    await this.ensureHerdrBin();
     await this.ensureSessionServer();
     return this.rawRequest(method, params, options);
   }
@@ -188,7 +194,7 @@ export class SshHerdrTransport implements HerdrTransport {
     });
     if (result.code !== 0) {
       throw new HerdrTransportError(
-        `writing ${filePath} on ${this.machineName} failed (exit ${String(result.code)}): ${snippet(result.stderr)}`,
+        `writing ${filePath} on ${this.target} failed (exit ${String(result.code)}): ${snippet(result.stderr)}`,
       );
     }
   }
@@ -197,7 +203,7 @@ export class SshHerdrTransport implements HerdrTransport {
     const result = await this.run(`mkdir -p ${shellQuote(dirPath)}`, { timeoutMs: this.requestTimeoutMs });
     if (result.code !== 0) {
       throw new HerdrTransportError(
-        `mkdir -p ${dirPath} on ${this.machineName} failed (exit ${String(result.code)}): ${snippet(result.stderr)}`,
+        `mkdir -p ${dirPath} on ${this.target} failed (exit ${String(result.code)}): ${snippet(result.stderr)}`,
       );
     }
   }
@@ -254,12 +260,12 @@ export class SshHerdrTransport implements HerdrTransport {
     // nohup + full redirection so ssh's channel closes immediately instead of
     // waiting on the server's lifetime.
     const start = await this.run(
-      `env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH nohup ${shellQuote(this.herdrBin)} --session ${shellQuote(this.session)} server </dev/null >/dev/null 2>&1 &`,
+      `env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH nohup ${shellQuote(this.requireHerdrBin())} --session ${shellQuote(this.session)} server </dev/null >/dev/null 2>&1 &`,
       { timeoutMs: this.requestTimeoutMs },
     );
     if (start.code !== 0) {
       throw new HerdrTransportError(
-        `starting the herdr session server on ${this.machineName} failed (exit ${String(start.code)}): ${snippet(start.stderr)}`,
+        `starting the herdr session server on ${this.target} failed (exit ${String(start.code)}): ${snippet(start.stderr)}`,
       );
     }
     for (let attempt = 0; ; attempt++) {
@@ -291,9 +297,9 @@ export class SshHerdrTransport implements HerdrTransport {
       throw new HerdrRpcError(
         method,
         "remote_command_too_large",
-        `remote herdr command for "${method}" on ${this.machineName} is ${Buffer.byteLength(command, "utf8")} bytes, ` +
+        `remote herdr command for "${method}" on ${this.target} is ${Buffer.byteLength(command, "utf8")} bytes, ` +
           `over the ~128 KiB per-argument exec limit of the remote host (${MAX_REMOTE_COMMAND_BYTES} after headroom). ` +
-          "Shrink the prompt/schema or place the call on a local machine.",
+          "Shrink the prompt/schema, or drop ssh so the call runs locally.",
       );
     }
     const result = await this.run(command, {
@@ -327,9 +333,55 @@ export class SshHerdrTransport implements HerdrTransport {
     ];
   }
 
+  /**
+   * Resolve the remote herdr binary once. Declared paths win; otherwise a
+   * login-shell PATH lookup (`bash -lc`) — the non-login ssh default has none.
+   */
+  private ensureHerdrBin(): Promise<string> {
+    if (this.resolvedHerdrBin) return Promise.resolve(this.resolvedHerdrBin);
+    if (!this.herdrBinPromise) {
+      const attempt = this.probeHerdrBin();
+      attempt.catch(() => {
+        if (this.herdrBinPromise === attempt) this.herdrBinPromise = undefined;
+      });
+      this.herdrBinPromise = attempt;
+    }
+    return this.herdrBinPromise;
+  }
+
+  private async probeHerdrBin(): Promise<string> {
+    if (this.declaredHerdrBin) {
+      this.resolvedHerdrBin = this.declaredHerdrBin;
+      return this.declaredHerdrBin;
+    }
+    const result = await this.run(`bash -lc ${shellQuote("command -v herdr")}`, {
+      timeoutMs: this.requestTimeoutMs,
+    });
+    const found = result.stdout.trim().split(/\r?\n/)[0]?.trim() ?? "";
+    if (result.code !== 0 || !found || !path.posix.isAbsolute(found)) {
+      throw new HerdrTransportError(
+        `could not find herdr on ${this.target}: ` +
+          `login-shell \`command -v herdr\` ` +
+          (result.code !== 0
+            ? `exited ${String(result.code)}${result.stderr.trim() ? `: ${snippet(result.stderr)}` : ""}`
+            : `returned ${JSON.stringify(found)}`) +
+          ". Install herdr on that host, or make it visible to a login shell there.",
+      );
+    }
+    this.resolvedHerdrBin = found;
+    return found;
+  }
+
+  private requireHerdrBin(): string {
+    if (!this.resolvedHerdrBin) {
+      throw new HerdrTransportError(`herdr binary on ${this.target} was used before it was resolved`);
+    }
+    return this.resolvedHerdrBin;
+  }
+
   /** `env -u ... <herdrBin> --session <s> <cli args...>`, fully shell-quoted. */
   private herdrCommand(cliArgs: string[]): string {
-    return ["env", "-u", "HERDR_SOCKET_PATH", "-u", "HERDR_CLIENT_SOCKET_PATH", this.herdrBin, "--session", this.session, ...cliArgs]
+    return ["env", "-u", "HERDR_SOCKET_PATH", "-u", "HERDR_CLIENT_SOCKET_PATH", this.requireHerdrBin(), "--session", this.session, ...cliArgs]
       .map(shellQuote)
       .join(" ");
   }
@@ -348,7 +400,7 @@ export class SshHerdrTransport implements HerdrTransport {
       const frame = findFrame(result.stdout, "result") ?? findFrame(result.stderr, "result");
       if (frame) return (frame as { result: unknown }).result;
       throw new HerdrTransportError(
-        `herdr CLI on ${this.machineName} printed no result frame for "${method}": ${snippet(result.stdout || result.stderr)}`,
+        `herdr CLI on ${this.target} printed no result frame for "${method}": ${snippet(result.stdout || result.stderr)}`,
       );
     }
     // Error frames go to stderr (print_response), exit code 1; usage errors

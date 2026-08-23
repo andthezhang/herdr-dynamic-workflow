@@ -40,6 +40,7 @@ test("the marketplace manifest has complete metadata and runnable actions", () =
     [
       ["npm", "ci"],
       ["npm", "run", "build"],
+      ["sh", "scripts/install-cli.sh"],
     ],
   );
 

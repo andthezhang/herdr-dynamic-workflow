@@ -77,6 +77,11 @@ export class FakeRemoteMachine {
   readonly dirs = new Set<string>();
   /** tab.create env captures, in order. */
   readonly tabEnvs: Array<Record<string, string>> = [];
+  /**
+   * What a login-shell `command -v herdr` probe returns. Empty / relative
+   * makes the transport fail the probe. Default: a plausible Homebrew path.
+   */
+  herdrOnPath = "/opt/homebrew/bin/herdr";
   /** True once `... server ... &` ran (or set in the constructor). */
   serverRunning: boolean;
   /** How many server_not_running probes to serve AFTER the server start ran. */
@@ -121,6 +126,12 @@ export class FakeRemoteMachine {
       return ok("");
     }
     const command = request.argv[request.argv.length - 1] ?? "";
+
+    // Login-shell herdr probe: `bash -lc 'command -v herdr'`
+    if (/^bash -lc /.test(command) && command.includes("command -v herdr")) {
+      if (!this.herdrOnPath) return fail(1, "bash: command -v herdr: not found");
+      return ok(`${this.herdrOnPath}\n`);
+    }
 
     // Server start: `env -u ... nohup <bin> --session <s> server </dev/null >/dev/null 2>&1 &`
     if (/\bnohup\b/.test(command) && /\bserver\b/.test(command) && command.trimEnd().endsWith("&")) {

@@ -43,5 +43,5 @@ Keep pull requests focused. Include:
 - any real Herdr or SSH validation performed
 - user-visible limitations that remain
 
-Do not commit `dist`, `node_modules`, credentials, fleet files containing real
-hostnames, or machine-specific home-directory paths.
+Do not commit `dist`, `node_modules`, credentials, real ssh hostnames, or
+host-specific home-directory paths.

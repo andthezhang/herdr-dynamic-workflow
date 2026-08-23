@@ -7,15 +7,21 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
+    "bin",
     "herdr-plugin.toml",
+    "scripts/install-cli.sh",
     "skills"
   ],
+  "bin": {
+    "herdr-dynamic-workflow": "./bin/herdr-dynamic-workflow"
+  },
   "scripts": {
     "test": "npm run check && npm run test:unit",
     "test:unit": "tsx --test tests/*.test.ts",
     "check": "tsc --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.build.json",
+    "install-cli": "sh scripts/install-cli.sh",
     "prepack": "npm run build"
   },
   "keywords": [

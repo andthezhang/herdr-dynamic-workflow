@@ -11,7 +11,7 @@
  * - The Pi WorkflowAgent default runner is gone: `options.agent` is REQUIRED.
  * - `.pi/agents` scanning is gone: the AgentTypeRegistry seam is injected.
  * - NEW identity inputs for the Herdr backend: agent() accepts `kind` (which
- *   coding-agent CLI) and `machine` (which host), both threaded into
+ *   coding-agent CLI) and `ssh` (which host), both threaded into
  *   AgentRunOptions AND into hashAgentCall — a resume must never replay a
  *   codex-on-host-A result as if claude-on-host-B produced it.
  * Copyright (c) 2026 QuintinShaw
@@ -98,7 +98,7 @@ export interface JournalEntry {
   runId?: string;
   /**
    * sha256 of the call's identity (prompt + model + tier + phase + agentType +
-   * agentDef + schema + kind + machine, plus effort and the runner's resolved
+   * agentDef + schema + kind + ssh, plus effort and the runner's resolved
    * runtime identity when present — see hashAgentCall).
    */
   hash: string;
@@ -343,9 +343,8 @@ export interface AgentOptions {
    */
   tier?: string;
   /**
-   * Effort/thinking level name (e.g. "high"), resolved by the runner (for the
-   * Herdr backend: through fleet.toml's [runtime.<kind>].effort table, SPEC D4).
-   * Part of the call's resume identity when set.
+   * Effort/thinking level name (e.g. "high"), passed through to the agent CLI
+   * by the runner. Part of the call's resume identity when set.
    */
   effort?: string;
   isolation?: "worktree";
@@ -363,11 +362,11 @@ export interface AgentOptions {
    */
   kind?: string;
   /**
-   * Herdr machine selector: which host runs this agent's pane — a machine name
-   * or a structured selector object. Part of the call's resume identity —
-   * changing it invalidates the cached result.
+   * ssh Host name (an alias from ~/.ssh/config, or user@host) whose Herdr runs
+   * this agent's pane. Omitted means the local Herdr. Part of the call's resume
+   * identity — changing it invalidates the cached result.
    */
-  machine?: string | Record<string, unknown>;
+  ssh?: string;
   /** Override timeout for this specific agent. null means no hard timeout. */
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
@@ -458,7 +457,7 @@ const KNOWN_AGENT_OPTION_KEYS = new Set<string>([
   "isolation",
   "agentType",
   "kind",
-  "machine",
+  "ssh",
   "timeoutMs",
   "retries",
 ]);
@@ -480,7 +479,10 @@ function validateAgentOptions(options: AgentOptions): void {
   for (const key of Object.keys(options)) {
     if (!KNOWN_AGENT_OPTION_KEYS.has(key)) {
       throw new WorkflowError(
-        `unknown agent() option "${key}" (known options: ${[...KNOWN_AGENT_OPTION_KEYS].join(", ")})`,
+        `unknown agent() option "${key}" (known options: ${[...KNOWN_AGENT_OPTION_KEYS].join(", ")})` +
+          // "machine" is not an alias: silently accepting it would keep placing
+          // calls on a host the identity hash no longer records.
+          (key === "machine" ? '. There is no machine option — pass ssh: "<host>" (an ssh alias) instead' : ""),
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false },
       );
@@ -497,13 +499,9 @@ function validateAgentOptions(options: AgentOptions): void {
       recoverable: false,
     });
   }
-  if (
-    opts.machine !== undefined &&
-    typeof opts.machine !== "string" &&
-    (typeof opts.machine !== "object" || opts.machine === null || Array.isArray(opts.machine))
-  ) {
+  if (opts.ssh !== undefined && (typeof opts.ssh !== "string" || !(opts.ssh as string).trim())) {
     throw new WorkflowError(
-      'agent() option "machine" must be a string or a plain selector object',
+      'agent() option "ssh" must be a non-empty ssh Host name (an alias from ~/.ssh/config, or user@host)',
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false },
     );
@@ -739,12 +737,12 @@ export async function runWorkflow<T = unknown>(script: string, options: Workflow
     const explicitModel = agentOptions.model ?? agentDef?.model;
     const modelSpec =
       explicitModel ?? (agentOptions.tier ? undefined : resolveModelForPhase(assignedPhase, routingConfig));
-    // Herdr identity: which coding-agent CLI (kind) on which host (machine).
-    // Call-site kind overrides the agentType definition's kind; machine has no
+    // Herdr identity: which coding-agent CLI (kind) on which host (ssh).
+    // Call-site kind overrides the agentType definition's kind; ssh has no
     // definition-level counterpart (the definition names WHAT runs, the call
     // site names WHERE).
     const resolvedKind = agentOptions.kind ?? agentDef?.kind;
-    const machine = agentOptions.machine;
+    const ssh = agentOptions.ssh;
     // For display: the model this agent runs on — its explicit/phase spec, else
     // the session's main model.
     const displayModel = modelSpec ?? options.mainModel;
@@ -904,7 +902,7 @@ export async function runWorkflow<T = unknown>(script: string, options: Workflow
               tier: agentOptions.tier,
               effort: agentOptions.effort,
               kind: resolvedKind,
-              machine,
+              ssh,
               cwd: runCwd,
               timeoutMs: timeout,
               onUsage: (u: AgentUsage) => {
@@ -970,11 +968,10 @@ export async function runWorkflow<T = unknown>(script: string, options: Workflow
             // result this attempt's writes should be attributed to.
             store.discardDelta(deltaKey);
 
-            // `retryable === false` (e.g. an escalated blocked call, which
-            // deliberately keeps holding its machine slot — SPEC D15) skips
-            // the retry loop and collapses to null below: re-attempting would
-            // open a duplicate worker, and on a machine at capacity the retry
-            // would park forever on the very slot the escalation holds.
+            // `retryable === false` (e.g. an escalated blocked call, whose
+            // pane is deliberately left open for a human — SPEC D15) skips the
+            // retry loop and collapses to null below: re-attempting would open
+            // a duplicate worker for the same logical call.
             if (workflowError.recoverable && workflowError.retryable && attempt < maxAttempts) {
               log(
                 `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
@@ -1648,18 +1645,15 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
  * Stable identity hash for an agent() call — the resume key's content half.
  * Covers everything that changes WHAT would run: prompt, model, tier, effort,
  * phase, agentType + resolved definition, schema, (Herdr) the agent kind and
- * the machine, and whatever identity the runner itself contributes (the
- * RESOLVED runtime flags/env from fleet config — SPEC D4: hash the resolved
- * flags, not just the requested name, so editing `[runtime.claude].model.opus`
- * invalidates the calls that used it). kind/machine are identity, not
- * metadata: a resume must never replay a codex-on-host-A result as if
- * claude-on-host-B produced it.
+ * the ssh host, and whatever identity the runner itself contributes (the
+ * RESOLVED launch flags — SPEC D4: hash the resolved flags, not just the
+ * requested name). kind/ssh are identity, not metadata: a resume must never
+ * replay a codex-on-host-A result as if claude-on-host-B produced it.
  * NOT in the identity (metadata only): label, isolation, timeoutMs, retries —
  * changing those must not invalidate a cached result.
  *
  * `effort` and `runnerIdentity` are folded in ONLY when present, so a call
- * without them hashes byte-identically to the pre-M2 format — journals written
- * before fleet config existed keep replaying.
+ * without them hashes byte-identically to the pre-M2 format.
  */
 function hashAgentCall(
   prompt: string,
@@ -1681,7 +1675,7 @@ function hashAgentCall(
     agentDef: agentDefKey,
     schema: options.schema ?? null,
     kind: resolvedKind ?? null,
-    machine: options.machine ?? null,
+    ssh: options.ssh ?? null,
     ...(options.effort !== undefined ? { effort: options.effort } : {}),
     ...(runnerIdentity !== undefined ? { runtime: runnerIdentity } : {}),
   });
@@ -1703,7 +1697,7 @@ function buildAgentInstructions(
   // Use resolvedIsolation so the annotation fires whether isolation came from
   // the call site or from the agentDef's isolation field.
   if (resolvedIsolation) lines.push(`Requested isolation: ${resolvedIsolation}`);
-  // Note: model/kind/machine are applied for real via AgentRunOptions, not injected as prose.
+  // Note: model/kind/ssh are applied for real via AgentRunOptions, not injected as prose.
   return lines.length ? lines.join("\n\n") : undefined;
 }
 

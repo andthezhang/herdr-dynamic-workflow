@@ -3,13 +3,11 @@
 // Neither helper is special — both are plain agent()/parallel() composition
 // exposed as globals so scripts don't have to hand-roll them every time.
 //
-//   herdr plugin action invoke herdrflow.engine.run -- "$PWD/skills/herdr-workflow-authoring/reference/quality-stdlib-hello.js" \
-//     --cwd "$PWD" --fleet "$PWD/skills/herdr-workflow-authoring/reference/luna.fleet.toml"
+//   herdr-dynamic-workflow '{"scriptPath":"skills/herdr-workflow-authoring/reference/quality-stdlib-hello.js"}'
 
 export const meta = {
   name: "quality_stdlib_hello",
   description: "verify() checks a claim, judgePanel() picks the better of two answers",
-  model: "gpt-5.6-luna",
   phases: [{ title: "Verify" }, { title: "Judge" }],
 };
 

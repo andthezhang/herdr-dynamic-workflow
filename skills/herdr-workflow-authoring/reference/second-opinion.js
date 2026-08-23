@@ -1,13 +1,11 @@
-// Two independent GPT-5.6 Luna reviewers inspect the same thing through
-// different lenses, then a third Luna call reconciles their verdicts.
+// Two independent reviewers inspect the same thing through different
+// lenses, then a third call reconciles their verdicts.
 //
-//   herdr plugin action invoke herdrflow.engine.run -- "$PWD/skills/herdr-workflow-authoring/reference/second-opinion.js" \
-//     --cwd "$PWD" --fleet "$PWD/skills/herdr-workflow-authoring/reference/luna.fleet.toml"
+//   herdr-dynamic-workflow '{"scriptPath":"skills/herdr-workflow-authoring/reference/second-opinion.js"}'
 
 export const meta = {
   name: "second_opinion",
-  description: "Two independent Luna reviewers inspect the same diff; a third reconciles them",
-  model: "gpt-5.6-luna",
+  description: "Two independent reviewers inspect the same diff; a third reconciles them",
   phases: [{ title: "Review" }, { title: "Reconcile" }],
 };
 

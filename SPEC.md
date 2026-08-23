@@ -13,13 +13,18 @@ bullet above).
   globals, same semantics — plus pi's quality helpers (`verify`, `judgePanel`,
   `loopUntilDry`, `completenessCheck`, `retry`, `gate`, `checkpoint`, `tier`,
   `timeoutMs`, `retries`). A Claude Code workflow script runs here unmodified.
-- Exactly **two additions**: `kind` (which agent CLI) and `machine` (which computer).
+- Exactly **two additions**: `kind` (which agent CLI) and `ssh` (which computer).
   Nothing else, ever — every deviation is a place where a generated script breaks.
 - An option the runtime cannot resolve is a **validation error, never a silent drop**
   (both parents silently ignore unknown options; a plausible result from a silently
   weaker configuration is the worst failure mode available).
 - Almost nothing is required. The smallest workflow is `meta` (name + description) and
-  one `agent()` call; defaults come from `fleet.toml` `[defaults]`.
+  one `agent()` call. Defaults: kind `claude`, and omitting `ssh` runs the call on the
+  engine's own computer.
+- The CLI is the host stand-in for Claude Code's Workflow tool: one JSON object
+  (`script` / `scriptPath` / `name` / `args` / `resumeFromRunId`) plus `kind` /
+  `session` / `cwd`. `additionalProperties: false`. `name` is rejected until we have a
+  saved-workflow registry. `ssh` stays on `agent()`.
 
 ## Engine
 
@@ -29,9 +34,9 @@ bullet above).
   `null` (never rejects); `pipeline` has no inter-stage barrier; retries collapse
   recoverable failures to `null` and throw non-recoverable ones loudly.
 - **Resume** replays the longest unchanged prefix from the journal. Call identity hashes
-  prompt / model / tier / phase / agentType / schema **plus `kind`, `machine`, and the
-  resolved runtime flags** — repointing a call or editing the fleet config invalidates
-  exactly the right cached results.
+  prompt / model / tier / phase / agentType / schema **plus `kind`, `ssh`, and the
+  resolved launch flags** — repointing a call at another host, or changing its
+  `model`/`effort`, invalidates exactly the right cached results.
 - Determinism is enforced (`Date.now()`, `Math.random()`, no-arg `new Date()` throw in
   the vm realm). The realm exists to protect the journal, **not as a security boundary**.
 - `budget` keeps Claude Code's shape but counts **agent calls + wall-clock** — Herdr
@@ -42,73 +47,75 @@ bullet above).
 - Local transport: newline-delimited JSON over the session's unix socket. Socket paths
   are always computed, **never read from `HERDR_SOCKET_PATH`** (inside a pane it points
   at the user's own session).
-- Topology per run: one workspace labeled `<meta.name> · <last4-of-runId>`; one tab per
-  agent call (the tab mints the pane and carries cwd/env/label). `agent.start --kind`,
-  then `agent.prompt` waiting on `["idle","done","blocked"]` (headless settles as
-  `done`, never `idle`).
+- Topology per run: one workspace labeled `<meta.name> · <last4-of-runId>`;
+  one tab per agent call (the tab mints the pane and carries cwd/env/label).
+  `agent.start --kind`, then `agent.prompt` waiting on `["idle","done","blocked"]`
+  (headless settles as `done`, never `idle`). Teardown closes each tab after the
+  call and the workspace on runner.close().
 - Results come from an **output-file contract** (`$HERDR_FLOW_OUT`), never screen
   scraping: Herdr's status is the clock, the file is the proof. Schemas are validated
   with ajv; non-compliance is a loud non-recoverable error, never a silent `null`. A
   missing file triggers a state re-check before the tagged degraded fallback
   (`agent.read` visible).
-- `blocked` policy (`fleet.toml`): `fail` (default) or `escalate` (pane kept open, slot
-  held, human attach command printed). `answer` is rejected as unsupported.
+- Launch flags are hardcoded in the start path, not configurable: claude gets
+  `--dangerously-skip-permissions`, codex `--sandbox workspace-write --ask-for-approval
+  never`. A call's `model` / `effort` are passed through verbatim as `--model` /
+  `--effort` — the CLI, not this engine, decides whether a name is real.
+- `blocked` policy: `fail` (default) or `escalate` (pane kept open, human attach command
+  printed). `answer` is rejected as unsupported.
 - `kind: "cline"` is rejected up front, in any spelling Herdr would normalize to cline:
   its detection manifest has no idle rule, so a wait on it can never resolve.
 - Worktree isolation (`isolation: "worktree"`) is cheap here — every call already has
   its own pane — and is the right default whenever parallel agents write files.
 
-## Fleet
+## Other computers
 
-- `fleet.toml`: `[defaults]` (kind/model/effort/on_blocked), `[runtime.<kind>]`
-  (permission / `model.*` / `effort.*` → CLI args + env — we never hardcode any
-  vendor's flags; a vendor rename is a one-line config edit), `[[machine]]`
-  (name/transport/herdr_bin/slots/tags/kinds/repos). No config file = one implicit
-  local machine, zero setup.
-- Remote machines run the plain `herdr` CLI over ssh at an **absolute `herdr_bin`**
-  (non-login shells have no PATH). This is Herdr's own remote-control pattern —
-  `herdr --remote` is a TUI byte-pipe and no remote API bridge exists. The worker
-  session's server is autostarted; ssh connections are reused (ControlMaster).
-- Placement: explicit machine name or `{tag}`, else the least-occupied machine that has
-  the call's `kind`. Per-machine `slots` are enforced atomically. Naming an
-  unconfigured machine is an error, never a silent fallback to local.
-- Remote results are read back over ssh; machine identity in the resume hash is the
-  stable machine **name**.
+- Zero-config and zero inventory: `ssh: "build-mac"` is an ssh **Host name** — an alias
+  from `~/.ssh/config`, or `user@host`. Your ssh config already knows the hosts, so
+  there is no config file to declare them in, and no tag selectors. Omitting `ssh` runs
+  the call on the engine's own computer.
+- A blank `ssh` is a validation error, never a silent fall back to local.
+- ssh hosts run the plain `herdr` CLI over ssh; the binary is found with a login-shell
+  probe (`bash -lc 'command -v herdr'`), because plain `ssh host 'cmd'` has no PATH.
+  ControlMaster reuses the connection; the worker session's server is autostarted.
+- One transport and one run workspace per destination. Results are written on the
+  worker's own host and read back over ssh; ssh tabs open in the remote HOME.
+- Worktree isolation cannot travel: combining a call-site `cwd` with `ssh` is a
+  validation error, because the path only exists on the engine's computer.
 
 ## UX
 
-- **Zero-config visibility**: with no `--session`, the run lands in the user's own
+- **Zero-config visibility**: with no `session` field, the run lands in the user's own
   session — workspace live in their sidebar, named after the workflow — falling back to
   a hidden autostarted `flow` worker session when no herdr is reachable.
-  `--session <name>` forces a named worker session; the name `default` is reserved.
-- Workers on remote machines always live in a named worker session there — never
-  another machine's personal session.
+  `session` forces a named worker session; the name `default` is reserved.
+- Workers on an ssh host always live in a named worker session there — never another
+  host's personal session.
 - **No UI of our own**: every worker is a real pane; watch, attach, or type into any of
   them mid-run. Ships as a Herdr plugin (`herdr plugin link .` locally, or a GitHub
   repo tagged `herdr-plugin`).
-- The result envelope reports `agentCount` and `durationMs` — no token numbers, because
-  none exist.
+- The result envelope reports `agentCount`, `durationMs`, and the workspace label.
+  No token numbers, because none exist.
 
 ## Known limitations
 
-- Resuming a fleet run requires re-passing the same `--fleet` (the path is not
-  persisted in the journal).
+- Named workflows (`invoke.name`) are not implemented. Pass `script` or `scriptPath`.
 - Journal replay returns cached **outputs**; filesystem effects do not replay. A
   resumed run's answers and its disk state can disagree (same hole as pi; durable
   worktrees keyed to the run id are the likely fix).
-- Remote worktree isolation is unsupported (explicit validation error).
+- Worktree isolation over ssh is unsupported (explicit validation error).
 - Reliability varies by kind: six runtimes report lifecycle through real hooks; the
   rest are screen-detected, and thin manifests (e.g. gemini) can settle early — the
   output-file contract is the safety net.
 - Output-contract compliance is model behavior, not enforced; expect a small fallback
   rate that varies by model.
-- Per-process slot accounting: two engines driving the same machine don't see each
-  other's occupancy.
+- No concurrency cap per destination: nothing stops a wide fan-out from opening many
+  panes on one ssh host.
 - macOS/Linux only.
 
 ## Open items
 
 - Durable worktrees keyed to runId (make replay and disk state agree).
-- Repo provisioning for remote machines (today: the machine must already have it).
+- Repo provisioning on ssh hosts (today: the host must already have the checkout).
 - Sidebar progress labels via `pane.report_metadata` / `agent.view.set` (nice-to-have).
 - Publish: GitHub repo + `herdr-plugin` tag.

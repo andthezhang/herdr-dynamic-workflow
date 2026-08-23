@@ -15,6 +15,8 @@ export {
 } from "./contract.js";
 export {
   assertWaitableKind,
+  buildStartArgs,
+  DEFAULT_KIND,
   DEFAULT_REMOTE_STATE_DIR,
   HERDR_BLOCKED,
   HerdrAgentRunner,

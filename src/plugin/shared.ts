@@ -9,8 +9,21 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { herdrConfigDir } from "../fleet/config.js";
 import type { JournalEntry } from "../index.js";
+
+/**
+ * Herdr's own config dir, mirrored exactly for the platforms the plugin
+ * supports (linux/macos — herdr src/config/io.rs config_dir):
+ * $XDG_CONFIG_HOME/herdr when set, else ~/.config/herdr. Everything that
+ * computes a path herdr also computes (session sockets) MUST go through this —
+ * hardcoding ~/.config silently diverges from a herdr running with
+ * XDG_CONFIG_HOME set. (Per the XDG spec an empty value counts as unset.)
+ */
+export function herdrConfigDir(env: NodeJS.ProcessEnv = process.env): string {
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  if (xdg) return path.join(xdg, "herdr");
+  return path.join(os.homedir(), ".config", "herdr");
+}
 
 /**
  * Where run state lives. Inside a Herdr plugin invocation this is the injected
@@ -77,15 +90,15 @@ export const DEFAULT_WORKER_SESSION = "flow";
  * - "default": the user's own session — its workspace shows in their sidebar.
  * - "worker": a named worker session (the "flow" fallback or an explicit
  *   --session), autostarted when its server is not running.
- * Remote machines are unaffected either way: they always use the named worker
- * session (never another machine's personal session).
+ * ssh hosts are unaffected either way: they always use the named worker
+ * session (never another host's personal session).
  */
 export type SessionMode = "default" | "worker";
 
 /** The resolved local placement target for a run (or a resume of one). */
 export interface ResolvedSessionTarget {
   /**
-   * Worker session NAME — what remote machines are driven under and what
+   * Worker session NAME — what ssh hosts are driven under and what
    * attach commands print. Stays "flow" (or the explicit --session value)
    * even in "default" mode; it is never the string "default".
    */
@@ -163,8 +176,8 @@ export async function resolveSessionTarget(
   // (herdr src/session.rs normalize_name -> the ~/.config/herdr/herdr.sock
   // socket, NOT sessions/default/). Accepting it as a worker name would poll
   // a socket herdr never creates while `herdr --session default server`
-  // squats on the user's personal session — and remotely it would drive
-  // ANOTHER machine's default session, the invariant this resolution exists
+  // squats on the user's personal session — and over ssh it would drive
+  // ANOTHER host's default session, the invariant this resolution exists
   // to make impossible. Reject it up front with the zero-config answer.
   if (worker === "default") {
     throw new Error(
@@ -214,7 +227,7 @@ export function successEnvelope(
     agentCount: number;
     durationMs: number;
   },
-  extra: { resumed?: boolean } = {},
+  extra: { resumed?: boolean; workspace?: string; kept?: boolean } = {},
 ): Record<string, unknown> {
   return {
     ok: true,
@@ -225,6 +238,8 @@ export function successEnvelope(
     phases: outcome.phases,
     agentCount: outcome.agentCount,
     durationMs: outcome.durationMs,
+    ...(extra.workspace ? { workspace: extra.workspace } : {}),
+    ...(extra.kept ? { kept: true } : {}),
   };
 }
 
@@ -246,6 +261,10 @@ export interface JournalDocument {
   cwd?: string;
   /** Full workflow script text, so resume replays exactly what ran. */
   script: string;
+  /** Invoke `args`, restored on resume when the new call omits them. */
+  args?: unknown;
+  /** Sidebar label (`meta.name · last-4-of-runId`). */
+  workspaceLabel?: string;
   entries: JournalEntry[];
 }
 
@@ -262,8 +281,8 @@ export function saveJournal(stateDir: string, doc: JournalDocument): void {
 
 /**
  * The most recently WRITTEN run journal's id, or undefined when none exist —
- * "last run" for resume.js when --run is omitted (and for the manifest's
- * argument-less "Resume last run" action). Recency is journal-file mtime: the
+ * "last run" for the manifest's argument-less "Resume last run" action.
+ * Recency is journal-file mtime: the
  * journal is re-saved after every agent
  * call, so mtime tracks last activity, not just creation.
  */
@@ -324,6 +343,15 @@ export function upsertJournalEntry(doc: JournalDocument, entry: JournalEntry): v
   const at = doc.entries.findIndex((existing) => journalEntryKey(existing, doc) === key);
   if (at >= 0) doc.entries[at] = entry;
   else doc.entries.push(entry);
+}
+
+/**
+ * Sidebar workspace name: meta.name, then last-4 of the run id so concurrent
+ * runs of the same workflow stay tellable apart.
+ */
+export function formatWorkspaceLabel(name: string, runId: string): string {
+  const prefix = name.replace(/[\r\n\t]+/g, " ").replace(/ +/g, " ").trim() || "workflow";
+  return `${prefix} · ${runId.slice(-4)}`;
 }
 
 /** Minimal flag parser: positionals plus `--name value` options. */

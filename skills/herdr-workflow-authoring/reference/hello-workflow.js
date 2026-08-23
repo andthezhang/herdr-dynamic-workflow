@@ -1,13 +1,11 @@
 // Hello-world for herdr-dynamic-workflow: two agents in sequence, each running
 // as a real coding-agent CLI in its own Herdr pane. `kind` picks the CLI.
 //
-//   herdr plugin action invoke herdrflow.engine.run -- "$PWD/skills/herdr-workflow-authoring/reference/hello-workflow.js" \
-//     --cwd "$PWD" --fleet "$PWD/skills/herdr-workflow-authoring/reference/luna.fleet.toml"
+//   herdr-dynamic-workflow '{"scriptPath":"skills/herdr-workflow-authoring/reference/hello-workflow.js"}'
 
 export const meta = {
   name: "hello_workflow",
   description: "One agent invents a haiku topic, a second agent writes the haiku",
-  model: "gpt-5.6-luna",
   phases: [{ title: "Topic" }, { title: "Haiku" }],
 };
 

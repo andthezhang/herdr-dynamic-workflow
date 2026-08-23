@@ -26,7 +26,6 @@ function makeTransport(machine: FakeRemoteMachine, overrides: Record<string, unk
     target: "build-mac",
     herdrBin: BIN,
     session: "flow",
-    machineName: "build-mac",
     exec: machine.exec,
     serverStartDelayMs: 1,
     serverStartRetries: 5,
@@ -127,7 +126,7 @@ test("shellQuote survives single quotes, newlines, $ and backticks", () => {
   assert.equal(tokenizeShell(`x ${shellQuote(nasty)} y`)[1], nasty);
 });
 
-test("remote command: absolute herdr_bin, --session, env -u hygiene, and full quoting of the prompt", async () => {
+test("remote command: absolute herdr path, --session, env -u hygiene, and full quoting of the prompt", async () => {
   const machine = new FakeRemoteMachine();
   const transport = makeTransport(machine);
   const prompt = `line one\nline 'two' with "$HOME" & stuff`;
@@ -142,7 +141,7 @@ test("remote command: absolute herdr_bin, --session, env -u hygiene, and full qu
     ["env", "-u", "HERDR_SOCKET_PATH", "-u", "HERDR_CLIENT_SOCKET_PATH"],
     "HERDR_*_SOCKET_PATH are always unset for the remote herdr (reference §7)",
   );
-  assert.equal(tokens[5], BIN, "the machine's declared absolute herdr_bin, never PATH (D13)");
+  assert.equal(tokens[5], BIN, "the declared absolute herdr path, never a PATH lookup (D13)");
   assert.deepEqual(tokens.slice(6, 8), ["--session", "flow"]);
   await transport.close();
 });
@@ -410,8 +409,35 @@ test("readTextFile is `cat` over ssh (undefined when missing); writeTextFile is 
 
 // ─── Constructor validation ───────────────────────────────────────────────────
 
-test("herdr_bin must be absolute (D13) and target/session non-empty", () => {
+test("herdrBin must be absolute (D13) and target/session non-empty", () => {
   assert.throws(() => new SshHerdrTransport({ target: "host", herdrBin: "herdr", session: "s" }), /ABSOLUTE/);
   assert.throws(() => new SshHerdrTransport({ target: " ", herdrBin: BIN, session: "s" }), /target/);
   assert.throws(() => new SshHerdrTransport({ target: "host", herdrBin: BIN, session: "" }), /session/);
+});
+
+test("omitted herdrBin is probed via a login shell on first request", async () => {
+  const machine = new FakeRemoteMachine();
+  const transport = makeTransport(machine, { herdrBin: undefined });
+  await transport.request("workspace.list");
+  const probe = machine.execs.find((exec) => {
+    const command = exec.argv[exec.argv.length - 1] ?? "";
+    return command.includes("command -v herdr");
+  });
+  assert.ok(probe, "first request must probe `command -v herdr` in a login shell");
+  assert.match(String(probe!.argv[probe!.argv.length - 1]), /bash -lc/);
+  const herdr = machine.cliCalls[0]!.raw;
+  assert.match(herdr, /\/opt\/homebrew\/bin\/herdr/, "probed path is used for later herdr commands");
+  await transport.close();
+});
+
+test("a failed herdr probe is a transport error, not a silent PATH lookup", async () => {
+  const machine = new FakeRemoteMachine();
+  machine.herdrOnPath = "";
+  const transport = makeTransport(machine, { herdrBin: undefined });
+  await assert.rejects(transport.request("workspace.list"), (error: unknown) => {
+    assert.ok(error instanceof HerdrTransportError);
+    assert.match(error.message, /could not find herdr/i);
+    return true;
+  });
+  await transport.close();
 });

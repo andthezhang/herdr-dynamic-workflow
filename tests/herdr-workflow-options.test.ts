@@ -1,6 +1,6 @@
 /**
  * Herdr workflow options added by this port:
- * - agent() accepts `kind` and `machine`, threads both into AgentRunOptions,
+ * - agent() accepts `kind` and `ssh`, threads both into AgentRunOptions,
  *   and folds both into hashAgentCall's identity (changing either invalidates
  *   the cached result on resume; keeping them stable cache-hits).
  * - Unknown agent() options throw SCRIPT_VALIDATION_ERROR instead of being
@@ -29,8 +29,8 @@ const kindScript = (kind: string) => `export const meta = { name: 'kind_id', des
 const a = await agent('task', { label: 'a', kind: ${JSON.stringify(kind)} })
 return a`;
 
-const machineScript = (machine: string) => `export const meta = { name: 'machine_id', description: 'machine identity' }
-const a = await agent('task', { label: 'a', machine: ${machine} })
+const sshScript = (ssh: string) => `export const meta = { name: 'ssh_id', description: 'ssh identity' }
+const a = await agent('task', { label: 'a', ssh: ${JSON.stringify(ssh)} })
 return a`;
 
 async function journalOf(script: string, runId: string): Promise<Map<string, JournalEntry>> {
@@ -54,25 +54,24 @@ test("runWorkflow requires options.agent — no default runner", async () => {
   );
 });
 
-test("agent() threads kind and machine into AgentRunOptions", async () => {
-  const seen: Array<{ kind?: string; machine?: unknown }> = [];
+test("agent() threads kind and ssh into AgentRunOptions", async () => {
+  const seen: Array<{ kind?: string; ssh?: unknown }> = [];
   const runner = {
-    async run(_p: string, o: { kind?: string; machine?: string | Record<string, unknown> }) {
-      seen.push({ kind: o.kind, machine: o.machine });
+    async run(_p: string, o: { kind?: string; ssh?: string }) {
+      seen.push({ kind: o.kind, ssh: o.ssh });
       return "ok";
     },
   };
-  const script = `export const meta = { name: 'thread', description: 'kind/machine threading' }
-await agent('a', { label: 'a', kind: 'codex', machine: 'workstation' })
-await agent('b', { label: 'b', kind: 'claude', machine: { host: 'gpu-box', arch: 'arm64' } })
+  const script = `export const meta = { name: 'thread', description: 'kind/ssh threading' }
+await agent('a', { label: 'a', kind: 'codex', ssh: 'daxzy-mac' })
+await agent('b', { label: 'b', kind: 'claude', ssh: 'alex@gpu-box' })
 await agent('c', { label: 'c' })
 return 1`;
   await runWorkflow(script, { agent: runner, persistLogs: false });
 
-  assert.deepEqual(seen[0], { kind: "codex", machine: "workstation" });
-  assert.equal(seen[1]?.kind, "claude");
-  assert.deepEqual({ ...(seen[1]?.machine as Record<string, unknown>) }, { host: "gpu-box", arch: "arm64" });
-  assert.deepEqual(seen[2], { kind: undefined, machine: undefined }, "absent options stay absent");
+  assert.deepEqual(seen[0], { kind: "codex", ssh: "daxzy-mac" });
+  assert.deepEqual(seen[1], { kind: "claude", ssh: "alex@gpu-box" });
+  assert.deepEqual(seen[2], { kind: undefined, ssh: undefined }, "absent options stay absent");
 });
 
 test("changing kind invalidates the cached result on resume; same kind cache-hits", async () => {
@@ -100,48 +99,41 @@ test("changing kind invalidates the cached result on resume; same kind cache-hit
   assert.equal(changed.state.calls, 1, "a changed kind must cache-miss and re-run live");
 });
 
-test("changing machine invalidates the cached result on resume; same machine cache-hits", async () => {
-  // String machine.
-  const journal = await journalOf(machineScript("'host-a'"), "machine-run");
+test("changing ssh invalidates the cached result on resume; the same ssh host cache-hits", async () => {
+  const journal = await journalOf(sshScript("host-a"), "ssh-run");
 
   const same = countingAgent();
-  await runWorkflow(machineScript("'host-a'"), {
+  await runWorkflow(sshScript("host-a"), {
     agent: same.runner,
     persistLogs: false,
-    runId: "machine-run",
+    runId: "ssh-run",
     resumeJournal: journal,
   });
-  assert.equal(same.state.calls, 0, "identical machine must cache-hit");
+  assert.equal(same.state.calls, 0, "an identical ssh host must cache-hit");
 
   const changed = countingAgent();
-  await runWorkflow(machineScript("'host-b'"), {
+  await runWorkflow(sshScript("host-b"), {
     agent: changed.runner,
     persistLogs: false,
-    runId: "machine-run",
+    runId: "ssh-run",
     resumeJournal: journal,
   });
-  assert.equal(changed.state.calls, 1, "a changed machine must cache-miss and re-run live");
+  assert.equal(changed.state.calls, 1, "a changed ssh host must cache-miss and re-run live");
+});
 
-  // Object machine selector.
-  const objJournal = await journalOf(machineScript("{ host: 'gpu-box', arch: 'arm64' }"), "machine-obj-run");
+test("adding ssh to a previously local call invalidates its cache entry", async () => {
+  const script = (opts: string) => `export const meta = { name: 'ssh_add', description: 'ssh added' }
+return await agent('task', { label: 'a'${opts} })`;
+  const journal = await journalOf(script(""), "ssh-add-run");
 
-  const objSame = countingAgent();
-  await runWorkflow(machineScript("{ host: 'gpu-box', arch: 'arm64' }"), {
-    agent: objSame.runner,
+  const changed = countingAgent();
+  await runWorkflow(script(", ssh: 'daxzy-mac'"), {
+    agent: changed.runner,
     persistLogs: false,
-    runId: "machine-obj-run",
-    resumeJournal: objJournal,
+    runId: "ssh-add-run",
+    resumeJournal: journal,
   });
-  assert.equal(objSame.state.calls, 0, "an identical machine selector object must cache-hit");
-
-  const objChanged = countingAgent();
-  await runWorkflow(machineScript("{ host: 'other-box', arch: 'arm64' }"), {
-    agent: objChanged.runner,
-    persistLogs: false,
-    runId: "machine-obj-run",
-    resumeJournal: objJournal,
-  });
-  assert.equal(objChanged.state.calls, 1, "a changed machine selector must cache-miss and re-run live");
+  assert.equal(changed.state.calls, 1, "moving a local call onto an ssh host must re-run live");
 });
 
 test("adding kind to a previously kind-less call invalidates its cache entry", async () => {
@@ -272,7 +264,7 @@ return await parallel([() => agent('task', { label: 'a', maschine: 'x' })])`;
   );
 });
 
-test("malformed kind/machine values are rejected loudly", async () => {
+test("malformed kind/ssh values are rejected loudly", async () => {
   const badKind = `export const meta = { name: 'bad_kind', description: 'bad kind' }
 return await agent('task', { kind: 42 })`;
   await assert.rejects(
@@ -281,20 +273,36 @@ return await agent('task', { kind: 42 })`;
       error instanceof WorkflowError && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR && /kind/.test(error.message),
   );
 
-  const badMachine = `export const meta = { name: 'bad_machine', description: 'bad machine' }
-return await agent('task', { machine: ['a', 'b'] })`;
+  for (const value of ["''", "'   '", "42", "{ tag: 'mac' }"]) {
+    const badSsh = `export const meta = { name: 'bad_ssh', description: 'bad ssh' }
+return await agent('task', { ssh: ${value} })`;
+    await assert.rejects(
+      () => runWorkflow(badSsh, { agent: countingAgent().runner, persistLogs: false }),
+      (error: unknown) =>
+        error instanceof WorkflowError &&
+        error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR &&
+        /"ssh" must be a non-empty ssh Host name/.test(error.message),
+      `ssh: ${value} must be rejected`,
+    );
+  }
+});
+
+test('the removed `machine` option is a loud validation error pointing at ssh, never a silent alias', async () => {
+  const script = `export const meta = { name: 'old_machine', description: 'machine is gone' }
+return await agent('task', { label: 'a', machine: 'build-mac' })`;
   await assert.rejects(
-    () => runWorkflow(badMachine, { agent: countingAgent().runner, persistLogs: false }),
+    () => runWorkflow(script, { agent: countingAgent().runner, persistLogs: false }),
     (error: unknown) =>
       error instanceof WorkflowError &&
       error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR &&
-      /machine/.test(error.message),
+      /unknown agent\(\) option "machine"/.test(error.message) &&
+      /pass ssh: "<host>"/.test(error.message),
   );
 });
 
-test("label changes still do NOT invalidate the cache (kind/machine are identity, label is metadata)", async () => {
+test("label changes still do NOT invalidate the cache (kind/ssh are identity, label is metadata)", async () => {
   const script = (label: string) => `export const meta = { name: 'label_meta', description: 'label metadata' }
-return await agent('task', { label: ${JSON.stringify(label)}, kind: 'codex', machine: 'host-a' })`;
+return await agent('task', { label: ${JSON.stringify(label)}, kind: 'codex', ssh: 'host-a' })`;
   const journal = await journalOf(script("first-label"), "label-run");
 
   const relabeled = countingAgent();

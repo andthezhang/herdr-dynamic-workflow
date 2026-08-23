@@ -24,13 +24,17 @@ scripts.
 
 | Input | Notes |
 | --- | --- |
-| `script` | Self-contained workflow script. Must begin with `export const meta = {...}`. |
+| `script` | Self-contained workflow script. Must begin with `export const meta = {...}`. Max 524,288 chars. |
 | `scriptPath` | Path to a script file on disk. Takes precedence over `script` and `name`. |
 | `name` | Name of a predefined workflow (built-in or from `.claude/workflows/`). |
-| `args` | Value exposed to the script as the global `args`, verbatim. |
-| `resumeFromRunId` | Run ID of a prior invocation to resume from. Same-session only. |
+| `args` | Value exposed to the script as the global `args`, verbatim. Untyped JSON. |
+| `resumeFromRunId` | Run ID of a prior invocation to resume from. Claude: `^wf_[a-z0-9-]{6,}$`. |
 | `title` | *Ignored* — set the workflow title in the script's `meta` block. |
 | `description` | *Ignored* — set the workflow description in the script's `meta` block. |
+
+No required fields. Precedence: `scriptPath > script > name`. `additionalProperties: false` on Claude's schema, except they still declare the vestigial `title` / `description` keys.
+
+Our CLI takes that same object. See the field-by-field table in [README.md](../README.md#claudes-workflow-tool-vs-this-cli). Differences: we reject `title` / `description`, we reject `name` until we have a registry, our `resumeFromRunId` is `run-…`, and we add `kind` / `session` / `cwd`. Claude tells the model to pass `script` inline and not Write a file. We tell the model to Write a file and pass `scriptPath`, because the host is a shell.
 
 ---
 
@@ -276,8 +280,9 @@ scripts.
 | `parallel` barrier / `pipeline` no-barrier semantics | inherited exactly |
 | `null` on dead agent, `.filter(Boolean)` idiom | inherited exactly |
 | determinism restrictions | inherited ([D7](../SPEC.md#d7-determinism-is-enforced-and-the-sandbox-is-not-a-security-boundary)) |
-| resume by longest-unchanged-prefix | inherited, plus machine and kind in the hash ([D6](../SPEC.md#d6-resume-is-longest-unchanged-prefix-replay-keyed-on-placement-too)) |
+| resume by longest-unchanged-prefix | inherited, plus the ssh host and kind in the hash ([D6](../SPEC.md#d6-resume-is-longest-unchanged-prefix-replay-keyed-on-placement-too)) |
 | pipeline-over-parallel guidance, quality patterns | should be carried into our authoring skill verbatim — it is good advice independent of substrate |
 | `budget` in tokens, hard ceiling | **not inheritable** — agents and wall-clock instead ([D8](../SPEC.md#d8-budget-counts-agents-and-wall-clock-not-tokens)) |
-| concurrency `min(16, cores-2)` | replaced by declared per-machine slots ([D12](../SPEC.md#d12-multi-machine-in-the-model-from-day-one-opt-in-for-the-user)) |
+| concurrency `min(16, cores-2)` | not capped per destination; a call names its host with `ssh` ([D13](../SPEC.md#d13-local-machines-use-the-socket-remote-machines-use-plain-herdr-over-ssh)) |
 | the opt-in gate | not applicable — invoking this engine is already an explicit act |
+| Workflow tool JSON (`script` / `scriptPath` / `name` / `args` / `resumeFromRunId`) | the CLI takes that object. `name` rejected until we have a registry. `title` / `description` rejected. Host extras: `kind`, `session`, `cwd` |

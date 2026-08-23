@@ -1,7 +1,7 @@
 # Composing agent() calls
 
 Deeper guidance for combining `agent()` / `parallel()` / `pipeline()` /
-`kind` / `machine` / the quality stdlib. Read this after `SKILL.md` once the
+`kind` / `ssh` / the quality stdlib. Read this after `SKILL.md` once the
 basics aren't enough — none of this is required to write a working script.
 
 ## `pipeline()` by default; `parallel()` only for a genuine barrier
@@ -42,10 +42,10 @@ while (bugs.length < 10) {
 or use `loopUntilDry`, which repeats rounds until N consecutive rounds
 surface nothing new — see the quality-stdlib table in `SKILL.md`.
 
-## Picking `kind` or `machine` per call inside a fan-out
+## Picking `kind` or `ssh` per call inside a fan-out
 
-`kind` and `machine` are just fields in the `options` object each thunk
-builds, so a fan-out can vary either per call:
+`kind` and `ssh` are just fields in the `options` object each thunk builds, so
+a fan-out can vary either per call:
 
 ```js
 // Same target, two independent lenses — see reference/second-opinion.js.
@@ -57,15 +57,15 @@ const [correctness, maintainability] = await parallel(
 ```
 
 ```js
-// Same prompt spread across every machine tagged "linux".
-const perMachine = await parallel(
-  linuxMachineNames.map((name) => () => agent(prompt, { machine: name, label: `run:${name}` })),
+// Same prompt spread across several ssh hosts, named in args.
+const perHost = await parallel(
+  args.hosts.map((host) => () => agent(prompt, { ssh: host, label: `run:${host}` })),
 );
 ```
 
-Remember: naming a `machine` (or tag) that resolves to zero configured
-machines is a validation error, not a silent fallback to local — check
-`fleet.toml` first if you're about to name one you haven't seen there.
+Remember: `ssh` is a Host name your ssh config already knows — there is no
+inventory file, and an empty one is a validation error rather than a silent
+fallback to this computer.
 
 ## Adversarial verify, by hand
 
@@ -100,17 +100,15 @@ everything.
 Every file in this directory is runnable as-is:
 
 ```bash
-herdr plugin action invoke herdrflow.engine.run -- \
-  "$PWD/skills/herdr-workflow-authoring/reference/<file>" \
-  --cwd "$PWD" --fleet "$PWD/skills/herdr-workflow-authoring/reference/luna.fleet.toml"
+herdr-dynamic-workflow '{"scriptPath":"skills/herdr-workflow-authoring/reference/<file>"}'
 ```
 
 | File | Pattern |
 | --- | --- |
 | `hello-workflow.js` | Sequential `agent()` calls across `phase()`s, `schema` for structured output, falling back when an agent returns `null`. |
-| `second-opinion.js` | `parallel()` fan-out with two independent GPT-5.6 Luna review lenses, comparing structured results, and a reconciliation call only when they disagree. |
+| `second-opinion.js` | `parallel()` fan-out with two independent review lenses, comparing structured results, and a reconciliation call only when they disagree. |
 | `quality-stdlib-hello.js` | `verify()` for adversarial fact-checking and `judgePanel()` for picking the best of several attempts. |
-| `fleet-hello.js` (use `fleet.example.toml`, not `luna.fleet.toml`) | Explicit `machine` placement — one Luna call local, one on a named remote fleet machine over ssh. |
+| `ssh-hello.js` | Explicit placement — one call here, one on a named ssh host. |
 | `mattcopock.js` | A router agent classifies a request into a flow, then a whole external skill's instructions are inlined into the executing `agent()` call's prompt — see "Inlining a skill into a prompt" below. |
 
 ## Inlining a skill into a prompt
@@ -136,5 +134,5 @@ consequences:
 The `review` branch goes a step further: the underlying skill's own process
 is "spawn two sub-agents in parallel, then aggregate" — which is exactly what
 `parallel()` with two thunks does, so the herdr version reuses the shape from
-"Picking `kind` or `machine` per call inside a fan-out", above, instead of
+"Picking `kind` or `ssh` per call inside a fan-out", above, instead of
 reinventing it.

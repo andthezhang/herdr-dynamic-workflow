@@ -59,8 +59,8 @@ export class WorkflowError extends Error {
    * that is recoverable-but-not-retryable collapses straight to null: the
    * outcome is final for THIS run but must not halt it. The canonical case is
    * a blocked call under on_blocked = "escalate" — the worker was deliberately
-   * left open (holding its pane and machine slot, SPEC D15), so re-attempting
-   * the same logical call would open a duplicate worker and, on a machine at
+   * left open (holding its pane, SPEC D15), so re-attempting the same logical
+   * call would open a duplicate worker and, on a host at
    * capacity, park the retry forever on the very slot the escalation holds.
    */
   readonly retryable: boolean;

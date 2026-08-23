@@ -59,8 +59,8 @@ export interface AgentRunOptions {
   effort?: string;
   /** Herdr agent kind — which coding-agent CLI to run (e.g. "claude", "codex"). */
   kind?: string;
-  /** Herdr machine selector — which host runs the pane (name or a structured selector). */
-  machine?: string | Record<string, unknown>;
+  /** ssh Host name whose Herdr runs the pane. Omitted means the local Herdr. */
+  ssh?: string;
   /** Working directory for the agent (e.g. an isolated worktree). */
   cwd?: string;
   /** The effective timeout the engine will enforce for this call (informational). */
@@ -80,8 +80,7 @@ export interface AgentRunOptions {
 /**
  * The subset of one agent call's options the runner may fold extra identity
  * onto (see WorkflowAgentRunner.callIdentity): exactly the options the runner
- * resolves through environment-level config (SPEC D4) rather than applying
- * verbatim.
+ * resolves into launch flags (SPEC D4) rather than applying verbatim.
  */
 export interface AgentCallIdentity {
   kind?: string;
@@ -96,10 +95,10 @@ export interface WorkflowAgentRunner {
   /**
    * Optional runner-provided identity data for the resume hash (SPEC D4/D6):
    * whatever this returns is JSON-folded into the call's identity hash, so a
-   * runner that RESOLVES options through config (e.g. `model: "opus"` ->
-   * `["--model", "opus"]` via fleet.toml) makes an edit to that config
-   * invalidate the cached calls that used it — the journal must never replay a
-   * result produced under different resolved flags as if nothing changed.
+   * runner that RESOLVES options into launch flags (e.g. `model: "opus"` ->
+   * `["--model", "opus"]`) makes a change to that resolution invalidate the
+   * cached calls that used it — the journal must never replay a result produced
+   * under different resolved flags as if nothing changed.
    *
    * Returning `undefined` means "no extra identity": the hash is byte-identical
    * to one computed before this seam existed, so journals from runners without

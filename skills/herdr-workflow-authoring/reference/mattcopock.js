@@ -13,18 +13,15 @@
 // end to end. Add a fourth the same way: one more ROUTE_MAP line, one more
 // embedded skill constant, one more branch below.
 //
-//   herdr plugin action invoke herdrflow.engine.run -- \
-//     "$PWD/skills/herdr-workflow-authoring/reference/mattcopock.js" \
-//     --cwd "$PWD" --fleet "$PWD/skills/herdr-workflow-authoring/reference/luna.fleet.toml"
+//   herdr-dynamic-workflow '{"scriptPath":"skills/herdr-workflow-authoring/reference/mattcopock.js","args":{"request":"..."}}'
 //
-// Routes the DEFAULT_REQUEST below unless the invoking CLI passes `args`
+// Routes the DEFAULT_REQUEST below unless the invoke object passes `args`
 // with a `request` field — edit DEFAULT_REQUEST directly to route something
 // else meanwhile.
 
 export const meta = {
   name: "mattcopock",
   description: "Classify a request into a flow (diagnose / build / review), then run that flow with its full instructions inlined",
-  model: "gpt-5.6-luna",
   phases: [{ title: "Route" }, { title: "Execute" }],
 };
 
