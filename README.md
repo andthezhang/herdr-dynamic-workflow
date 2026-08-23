@@ -9,7 +9,7 @@ or on another machine over SSH.
 
 Requirements:
 
-- Herdr 0.8.1 or newer
+- Herdr 0.8.0 or newer
 - Node.js 20 or newer
 - Git
 - At least one coding-agent CLI configured in Herdr

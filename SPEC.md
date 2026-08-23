@@ -3,7 +3,7 @@
 Claude Code's dynamic-workflow engine, on Herdr: `agent()` runs a real coding-agent CLI
 in a Herdr pane instead of a headless API subagent. Everything here is implemented and
 live-verified unless listed under limitations. The long-form research behind these
-bullets lives in [`reference/`](./reference/); the git history has the original
+bullets lives in [`docs/`](./docs/); the git history has the original
 numbered spec (code comments citing `SPEC D<n>` refer to it — each D-number maps to a
 bullet above).
 

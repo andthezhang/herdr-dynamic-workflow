@@ -20,7 +20,7 @@
  * The socket path is ALWAYS the one the caller constructed explicitly. This
  * module NEVER reads HERDR_SOCKET_PATH from the environment: inside a
  * Herdr-managed pane that variable is injected by Herdr and points at the
- * USER'S OWN host session (reference/herdr-runtime-support.md §7) — reading it
+ * USER'S OWN host session (docs/herdr-runtime-support.md §7) — reading it
  * would silently drive the wrong session. The constructor therefore requires
  * an explicit `socketPath` and throws without one, even when the env var is
  * set.

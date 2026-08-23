@@ -1,5 +1,5 @@
 /**
- * The output-file contract (reference/herdr-runtime-support.md §6): how a
+ * The output-file contract (docs/herdr-runtime-support.md §6): how a
  * pane-hosted coding agent hands its answer back to the workflow without any
  * per-runtime parsing.
  *

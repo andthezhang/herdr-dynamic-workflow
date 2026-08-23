@@ -1,7 +1,7 @@
 /**
  * HerdrAgentRunner: the WorkflowAgentRunner backend that runs each agent()
  * call as a real coding-agent CLI inside a Herdr pane, per
- * reference/herdr-runtime-support.md §1 and SPEC D11 topology (one workspace
+ * docs/herdr-runtime-support.md §1 and SPEC D11 topology (one workspace
  * per run PER MACHINE, one tab per agent call, one pane per tab, never split —
  * a fresh headless worker session has ZERO panes, so there is nothing to
  * split from):
