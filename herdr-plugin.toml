@@ -1,0 +1,38 @@
+id = "herdrflow.engine"
+name = "Herdr Dynamic Workflow"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "CLI and agent skill for workflows across coding-agent CLIs, here or over SSH"
+platforms = ["linux", "macos"]
+
+# node is the runtime; the engine is TypeScript adapted from pi-dynamic-workflows.
+[[build]]
+command = ["npm", "ci"]
+
+[[build]]
+command = ["npm", "run", "build"]
+
+# Puts herdr-dynamic-workflow next to the herdr binary so any terminal can run it.
+[[build]]
+command = ["sh", "scripts/install-cli.sh"]
+
+# Copy the authoring skill into agent clients detected by the skills CLI.
+[[build]]
+command = ["sh", "scripts/install-skill.sh"]
+
+# herdr plugin action invoke cannot pass the JSON object on Herdr 0.8.x.
+# Use: herdr-dynamic-workflow <<'JSON'
+# { "scriptPath": "workflow.js" }
+# JSON
+[[actions]]
+id = "run"
+title = "Run workflow"
+contexts = ["global"]
+command = ["node", "dist/plugin/run.js"]
+
+# With no --run argument, resume.js resumes the most recently written journal.
+[[actions]]
+id = "resume"
+title = "Resume last run"
+contexts = ["global"]
+command = ["node", "dist/plugin/resume.js"]

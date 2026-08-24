@@ -1,0 +1,53 @@
+{
+  "name": "herdr-dynamic-workflow",
+  "version": "0.1.0",
+  "description": "A CLI and agent skill for orchestrating coding-agent workflows in Herdr.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "bin",
+    "herdr-plugin.toml",
+    "scripts/install-cli.sh",
+    "scripts/install-skill.sh",
+    "skills"
+  ],
+  "bin": {
+    "herdr-dynamic-workflow": "./bin/herdr-dynamic-workflow"
+  },
+  "scripts": {
+    "test": "npm run check && npm run test:unit",
+    "test:unit": "tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "install-cli": "sh scripts/install-cli.sh",
+    "install-skill": "sh scripts/install-skill.sh",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "herdr",
+    "herdr-plugin",
+    "workflow",
+    "dynamic-workflows",
+    "orchestration",
+    "multi-agent",
+    "claude-code"
+  ],
+  "author": "Herdr Dynamic Workflow contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "acorn": "^8.16.0",
+    "ajv": "^8.17.0",
+    "smol-toml": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
