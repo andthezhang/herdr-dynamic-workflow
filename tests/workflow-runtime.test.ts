@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AgentUsage } from "../src/engine/agent-runner.js";
+import type { AgentRunOptions, AgentUsage } from "../src/engine/agent-runner.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/engine/errors.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/engine/workflow.js";
 
@@ -189,6 +189,28 @@ return a`,
 
   assert.equal(result.result, "ok");
   assert.equal(calls, 2);
+});
+
+test("cleanup:false reaches every attempt of a retried call, not just the last one", async () => {
+  const seenCleanup: Array<boolean | undefined> = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'cleanup_every_attempt', description: 'retry scoping' }
+const a = await agent('work', { label: 'a', retries: 1, cleanup: false })
+return a`,
+    {
+      agent: {
+        async run(_prompt: string, options: AgentRunOptions) {
+          seenCleanup.push(options.cleanup);
+          return seenCleanup.length === 1 ? "" : "ok";
+        },
+      },
+      agentRetries: 0,
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.deepEqual(seenCleanup, [false, false], "cleanup:false is not knowable-in-advance as \"final\", so every attempt gets it");
 });
 
 test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)", async () => {

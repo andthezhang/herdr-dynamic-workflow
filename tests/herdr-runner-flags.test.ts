@@ -424,6 +424,48 @@ test("the default fail policy tears the blocked pane down and the call collapses
   }
 });
 
+test("the default fail policy tears the blocked pane down even when the call asked cleanup:false", async () => {
+  const harness = await startHarness();
+  const { server } = harness;
+  server.on("agent.prompt", (params) => ({
+    type: "agent_prompted",
+    agent: server.makeAgentInfo((params as { target?: unknown })?.target, "blocked"),
+  }));
+  try {
+    await assert.rejects(
+      harness.runner.run("needs approval", { label: "worker", cleanup: false }),
+      (error: unknown) => error instanceof HerdrWorkflowError && error.herdrCode === HERDR_BLOCKED,
+    );
+    assert.equal(server.callsFor("tab.close").length, 1, "cleanup:false must not override the fail policy's teardown");
+    await harness.runner.close();
+    assert.equal(
+      server.callsFor("workspace.close").length,
+      1,
+      "a fail-policy block must not count as a preserved tab keeping the workspace open",
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("the default fail policy tears the blocked pane down even when keepWorkspace is set", async () => {
+  const harness = await startHarness({ keepWorkspace: true });
+  const { server } = harness;
+  server.on("agent.prompt", (params) => ({
+    type: "agent_prompted",
+    agent: server.makeAgentInfo((params as { target?: unknown })?.target, "blocked"),
+  }));
+  try {
+    await assert.rejects(
+      harness.runner.run("needs approval", { label: "worker" }),
+      (error: unknown) => error instanceof HerdrWorkflowError && error.herdrCode === HERDR_BLOCKED,
+    );
+    assert.equal(server.callsFor("tab.close").length, 1, "keepWorkspace must not override the fail policy's teardown");
+  } finally {
+    await harness.close();
+  }
+});
+
 test('escalate in zero-config default mode: the attach command omits --session (the pane is in the USER\'S OWN session)', async () => {
   // run.js keeps session as the worker NAME ("flow"/"flowtest") even when
   // local placement targeted the user's own default session — but the pane

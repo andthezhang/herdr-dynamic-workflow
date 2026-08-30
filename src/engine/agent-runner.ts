@@ -63,6 +63,13 @@ export interface AgentRunOptions {
   ssh?: string;
   /** Working directory for the agent (e.g. an isolated worktree). */
   cwd?: string;
+  /**
+   * Default true. False leaves this call's tab (and its destination's
+   * workspace) open after the call finishes, instead of the runner's usual
+   * auto-teardown, so a human can inspect it in the Herdr sidebar. A no-op for
+   * a runner with no visible session state.
+   */
+  cleanup?: boolean;
   /** The effective timeout the engine will enforce for this call (informational). */
   timeoutMs?: number | null;
   /** Called once with this agent's real usage. Reporting 0 is fine. */

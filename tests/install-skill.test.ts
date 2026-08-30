@@ -19,7 +19,7 @@ test("install-skill copies the bundled skill globally without prompts", () => {
     );
     chmodSync(fakeNpx, 0o755);
 
-    const result = spawnSync("sh", [path.join(root, "scripts/install-skill.sh")], {
+    const result = spawnSync(process.execPath, [path.join(root, "scripts/install-skill.mjs")], {
       cwd: root,
       encoding: "utf8",
       env: {

@@ -30,8 +30,10 @@ implicitly "more Claude."
 ## How a run starts
 
 The CLI takes one JSON object. Same fields as Claude Code's Workflow tool,
-plus `kind` / `session` / `cwd`. Write the script to a file, then pipe the
-object:
+plus `kind` / `session` / `cwd`. Unlike Claude Code's tool, unknown keys are a
+hard error here — `title`/`description` (which Claude Code accepts and
+silently ignores) fail validation instead of being a no-op. Write the script
+to a file, then pipe the object:
 
 ```bash
 herdr-dynamic-workflow <<'JSON'
@@ -44,7 +46,10 @@ JSON
 
 There is no compile step. Zero config: the run appears live in your own
 Herdr sidebar as `<meta.name> · <last-4-of-run-id>`, one tab per `agent()`
-call. If your session is unreachable it falls back to a hidden `flow`
+call, while that call is in flight. Each tab closes as soon as its call
+finishes, and the whole workspace closes when the run ends — pass
+`cleanup: false` on a call to leave its tab (and the workspace) open instead,
+see below. If your session is unreachable it falls back to a hidden `flow`
 worker session. On success you get back `{ result, agentCount, durationMs }`.
 No token numbers (see "budget", below).
 
@@ -85,8 +90,9 @@ sandbox — not a general Node process:
 
 1. **The first statement must be `export const meta = { ... }`**, a plain
    object literal — no variables, function calls, spreads, or computed keys.
-   `name` and `description` are required; `phases: [{ title }, ...]` is
-   optional and only affects progress display.
+   `name` and `description` are required; `phases: [{ title, model? }, ...]`
+   is optional — `title` only affects progress display, but a phase's `model`
+   sets that phase's default model (see `agent()` options, below).
 2. **Plain JavaScript, not TypeScript.** No type annotations, interfaces, or
    generics — they fail to parse. No `import` — everything the script needs
    (`agent`, `parallel`, `log`, …) is already a global.
@@ -130,8 +136,11 @@ await agent(prompt, {
                // data instead of a string. Not a builder; the script never
                // imports anything, so this is a literal object.
   model,       // passed to the CLI as --model, verbatim (e.g. "opus")
+  tier,        // coarse model name, used when model is omitted — also resolves through --model
   effort,      // passed to the CLI as --effort, verbatim (e.g. "high")
   isolation,   // "worktree" — see "Isolation", below
+  cleanup,     // default true — false leaves this call's tab open when it
+               // finishes, instead of the usual auto-close — see below
 });
 ```
 
@@ -187,6 +196,25 @@ whenever agents in the same `parallel()`/`pipeline()` write files — two agents
 editing one checkout is a data race the engine cannot fix. (A worktree only
 exists on this computer, so combining `isolation` with `ssh` is an error.)
 
+## `cleanup: false` keeps one call's tab open for inspection
+
+By default every tab closes the moment its call finishes, and the run's
+workspace closes with it — nothing lingers in your sidebar to clean up by
+hand. Set `cleanup: false` on a specific `agent()` call to leave that one tab
+open instead, e.g. a review worth reading afterward rather than just trusting
+its return value:
+
+```js
+const review = await agent("Review the diff for security issues.", { cleanup: false });
+```
+
+The workspace then survives the run's own teardown too — closing it, and
+everything inside it, becomes something you (or another tool) do explicitly
+in Herdr, not something this engine does for you. It applies to every attempt
+of a retried call, not just the last one — a failed attempt gets a tab of its
+own worth inspecting too, and there's no way to know in advance which attempt
+will turn out to be the final one.
+
 ## Where to go next
 
 - `reference/patterns.md` — composing `pipeline()`/`parallel()`/the quality
@@ -195,7 +223,6 @@ exists on this computer, so combining `isolation` with `ssh` is an error.)
   fan-out, hand-rolled adversarial verify, and how to inline an existing
   skill's instructions into an `agent()` prompt when the subagent CLI won't
   have that skill installed.
-- `reference/*.js` — five runnable example scripts, one per pattern above.
-  When asked to write a new workflow, start from whichever is closest to the
-  shape of the task and adapt it, rather than writing the script shape from
-  memory.
+- `reference/*.js` — one runnable example per pattern above. When asked to
+  write a new workflow, start from whichever is closest to the shape of the
+  task and adapt it, rather than writing the script shape from memory.

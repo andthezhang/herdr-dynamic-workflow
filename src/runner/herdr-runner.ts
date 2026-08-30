@@ -318,6 +318,15 @@ interface CallContext {
   escalated?: boolean;
   /** Set when the call's AbortSignal fired; finally still closes the tab. */
   aborted?: boolean;
+  /**
+   * Set when the "fail" (default) onBlocked policy claimed this call: its own
+   * error message promises "the tab is torn down with this failure", so
+   * neither keepWorkspace nor a call's own `cleanup: false` may override that
+   * — a blocked-and-failed pane has nothing left to inspect, and a script that
+   * keeps retrying the same block would otherwise leak one dead tab per
+   * attempt instead of the promised zero.
+   */
+  blockedFail?: boolean;
 }
 
 const USAGE_ZERO = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
@@ -363,6 +372,14 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
    * human was told to go answer.
    */
   private readonly escalations = new Map<string, number>();
+  /**
+   * Tabs left open per destination by a call's own `cleanup: false`, distinct
+   * from escalations (which also release when the human answers). A call-site
+   * request never releases — the tab stays until a human closes the
+   * workspace — so, like escalations, close() must not close a workspace with
+   * any of these against it.
+   */
+  private readonly preservedTabs = new Map<string, number>();
   /** Monotonic across every run() on this runner: unique names and out paths. */
   private callSeq = 0;
   private readonly fallbackRunId = `r${Date.now().toString(36)}`;
@@ -549,9 +566,20 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
     } finally {
       // Escalated blocked calls keep their tab (and pane, and agent) alive for
       // the human the escalation points at — SPEC D15. keepWorkspace does the
-      // same for finished tabs (so a review workspace is not empty), except
-      // abort still tears the cancelled tab down.
-      const keepTab = context.escalated || (this.keepWorkspace && !context.aborted);
+      // same for every finished tab (so a review workspace is not empty), and
+      // a call's own `cleanup: false` does it for just that one tab. Abort and
+      // a "fail"-policy block both override all of that — the caller asked
+      // for teardown, or (respectively) raiseBlocked's own error message
+      // already promised the tab is gone; a repeatedly-retried block must not
+      // leak one dead tab per attempt just because cleanup/keepWorkspace asked
+      // to preserve it.
+      const requestedNoCleanup = options.cleanup === false;
+      const forceClose = context.aborted || context.blockedFail;
+      const keepTab = context.escalated || ((this.keepWorkspace || requestedNoCleanup) && !forceClose);
+      if (requestedNoCleanup && !forceClose) {
+        const key = destinationKey(ssh);
+        this.preservedTabs.set(key, (this.preservedTabs.get(key) ?? 0) + 1);
+      }
       if (context.tabId && !keepTab && context.transport) {
         await this.closeTab(context.transport, context.tabId);
       }
@@ -564,18 +592,20 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
    * teardown is best-effort so a dead server never turns shutdown into a crash.
    *
    * EXCEPT for destinations where the escalate policy left blocked workers
-   * open, or when keepWorkspace is set: those tabs live in that destination's
-   * workspace, and closing it would kill exactly the panes a human was told to
-   * keep (SPEC D15, keepWorkspace). Those workspaces are left alive (only the
-   * transports close — which severs no panes) and remain findable by their
-   * workspace label (the caller's workspaceLabel, else `flow/<runId>`).
+   * open, a call requested `cleanup: false`, or keepWorkspace is set: those
+   * tabs live in that destination's workspace, and closing it would kill
+   * exactly the panes a human was told to keep (SPEC D15, keepWorkspace) or
+   * asked to go inspect. Those workspaces are left alive (only the transports
+   * close — which severs no panes) and remain findable by their workspace
+   * label (the caller's workspaceLabel, else `flow/<runId>`).
    */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     try {
       for (const [key, promise] of this.workspacePromises) {
-        if (this.keepWorkspace || (this.escalations.get(key) ?? 0) > 0) continue;
+        if (this.keepWorkspace || (this.escalations.get(key) ?? 0) > 0 || (this.preservedTabs.get(key) ?? 0) > 0)
+          continue;
         const transport = this.transports.get(key);
         if (!transport) continue;
         const workspaceId = this.workspaceIds.get(key) ?? (await promise.catch(() => undefined));
@@ -1111,6 +1141,7 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
       ...(explanation !== undefined ? { explanation } : {}),
     };
     if (this.onBlocked !== "escalate") {
+      context.blockedFail = true;
       return new HerdrWorkflowError(
         `agent "${context.label}" is blocked on an approval/question prompt (agent ${context.agentName}, pane ${context.paneId}; the tab is torn down with this failure)`,
         WorkflowErrorCode.AGENT_EXECUTION_ERROR,
@@ -1237,6 +1268,15 @@ export class HerdrAgentRunner implements WorkflowAgentRunner {
 
   private async closeWorkspace(transport: HerdrTransport, workspaceId: string): Promise<void> {
     try {
+      // NOT close_group: true (yet) — verified live against a real fleet
+      // machine still on herdr 0.8.0: its CLI rejects an unrecognized --group
+      // outright ("usage: herdr workspace close <workspace_id>"), so sending
+      // it unconditionally would break workspace-close TODAY on any host not
+      // yet upgraded. A newer herdr requiring --group for a workspace with
+      // linked worktree-isolated siblings is a real future gap (untracked
+      // here), but needs version detection before this call can send it
+      // safely — see buildHerdrCliArgs's close_group -> --group mapping,
+      // which is ready for that once this call is.
       await transport.request("workspace.close", { workspace_id: workspaceId }, { timeoutMs: this.requestTimeoutMs });
     } catch {
       // Best-effort; the workspace may already be gone.

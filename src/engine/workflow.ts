@@ -349,6 +349,16 @@ export interface AgentOptions {
   effort?: string;
   isolation?: "worktree";
   /**
+   * Default true. False leaves this call's tab (and its destination's
+   * workspace) open when the call finishes, instead of the runner's usual
+   * auto-teardown, so a human can inspect it in the Herdr sidebar. Applies to
+   * EVERY attempt of a retried call, not just the last one — whether an
+   * attempt is the final one is never knowable before it resolves (it could
+   * simply succeed), so a failed-and-retried attempt's tab is preserved too.
+   * A no-op for a runner with no visible session state.
+   */
+  cleanup?: boolean;
+  /**
    * Name of a registered agent-type definition. Binds that definition's role
    * prompt, kind, model, and isolation to this agent. An explicit call-site
    * option overrides the definition's value. An unknown name logs a warning
@@ -460,6 +470,7 @@ const KNOWN_AGENT_OPTION_KEYS = new Set<string>([
   "ssh",
   "timeoutMs",
   "retries",
+  "cleanup",
 ]);
 
 /**
@@ -505,6 +516,11 @@ function validateAgentOptions(options: AgentOptions): void {
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false },
     );
+  }
+  if (opts.cleanup !== undefined && typeof opts.cleanup !== "boolean") {
+    throw new WorkflowError('agent() option "cleanup" must be a boolean', WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+      recoverable: false,
+    });
   }
 }
 
@@ -905,6 +921,12 @@ export async function runWorkflow<T = unknown>(script: string, options: Workflow
               ssh,
               cwd: runCwd,
               timeoutMs: timeout,
+              // Applies to every attempt, not just a guessed-at "final" one:
+              // whether THIS attempt is the last never decides in advance — a
+              // call can succeed on attempt 1 and never reach maxAttempts, so
+              // gating on attempt === maxAttempts would silently drop the
+              // option for the (far more common) early-success case.
+              cleanup: agentOptions.cleanup,
               onUsage: (u: AgentUsage) => {
                 usage = u;
               },

@@ -9,8 +9,8 @@
     "dist",
     "bin",
     "herdr-plugin.toml",
-    "scripts/install-cli.sh",
-    "scripts/install-skill.sh",
+    "scripts/install-cli.mjs",
+    "scripts/install-skill.mjs",
     "skills"
   ],
   "bin": {
@@ -22,8 +22,8 @@
     "check": "tsc --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.build.json",
-    "install-cli": "sh scripts/install-cli.sh",
-    "install-skill": "sh scripts/install-skill.sh",
+    "install-cli": "node scripts/install-cli.mjs",
+    "install-skill": "node scripts/install-skill.mjs",
     "prepack": "npm run build"
   },
   "keywords": [
@@ -35,7 +35,7 @@
     "multi-agent",
     "claude-code"
   ],
-  "author": "Herdr Dynamic Workflow contributors",
+  "author": "andthezhang",
   "license": "MIT",
   "engines": {
     "node": ">=20"

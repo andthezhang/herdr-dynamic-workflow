@@ -451,7 +451,12 @@ export function buildHerdrCliArgs(method: string, params: Record<string, unknown
         ...envFlags(params.env),
       ];
     case "workspace.close":
-      return ["workspace", "close", requireString(method, "workspace_id", params.workspace_id)];
+      return [
+        "workspace",
+        "close",
+        requireString(method, "workspace_id", params.workspace_id),
+        ...(params.close_group === true ? ["--group"] : []),
+      ];
     case "tab.create":
       return [
         "tab",

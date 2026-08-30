@@ -45,6 +45,12 @@ test("buildHerdrCliArgs maps every runner operation onto the verified CLI flags"
     "--no-focus",
   ]);
   assert.deepEqual(buildHerdrCliArgs("workspace.close", { workspace_id: "w1" }), ["workspace", "close", "w1"]);
+  assert.deepEqual(buildHerdrCliArgs("workspace.close", { workspace_id: "w1", close_group: true }), [
+    "workspace",
+    "close",
+    "w1",
+    "--group",
+  ]);
   assert.deepEqual(
     buildHerdrCliArgs("tab.create", {
       workspace_id: "w1",

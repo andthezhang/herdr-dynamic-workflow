@@ -1,10 +1,20 @@
 # Herdr Dynamic Workflow
 
-A [Herdr](https://herdr.dev) plugin that packages a workflow CLI and an agent
-skill. It does not register a new tool inside Codex, Claude, Cursor, or another
-agent. The skill teaches an agent to write a workflow and invoke the CLI. The
-CLI then runs each `agent()` call as a real coding-agent process in a Herdr
-pane, in sequence, in parallel, in an isolated git worktree, or over SSH.
+A [Herdr](https://herdr.dev) plugin for Claude Code's dynamic-workflow
+dialect. The same `agent()` / `parallel()` / `pipeline()` scripting model
+behind Claude Code's own `Workflow` tool, driving real coding-agent processes
+in Herdr panes instead of Claude subagents inside one session.
+
+Two things Claude's own tool can't do:
+
+- Run [any agent Herdr supports](https://herdr.dev/docs/agents/#supported-agents),
+  not just Claude. Pick the CLI per `agent()` call with `kind`.
+- Place a call on another computer over SSH. `agent({ ssh: "linux-box" })`
+  runs it there instead of here.
+
+It does not register a new tool inside any agent CLI. A bundled skill teaches
+an agent to write a workflow and invoke the CLI; the CLI owns the runtime,
+running each call in sequence, in parallel, or in an isolated git worktree.
 
 ## Install
 
@@ -13,12 +23,13 @@ Requirements:
 - Herdr 0.8.0 or newer
 - Node.js 20 or newer
 - Git
-- At least one coding-agent CLI configured in Herdr
+- At least one [coding-agent CLI Herdr supports](https://herdr.dev/docs/agents/#supported-agents),
+  configured in Herdr
 
-Install the plugin from GitHub, replacing `<owner>` with the repository owner:
+Install the plugin from GitHub:
 
 ```bash
-herdr plugin install <owner>/herdr-dynamic-workflow
+herdr plugin install andthezhang/herdr-dynamic-workflow
 ```
 
 That installation also:
@@ -102,11 +113,12 @@ inspection.
 
 Large inline `script` values can blow argv. Pipe the object on stdin, or write
 a file and pass `scriptPath`. Claude tells the model to pass `script` inline
-and never Write a file first. We cannot do that: this host is a shell command.
+and never Write a file first. We cannot do that. This host is a shell command.
 
 The run opens a Herdr workspace named `<meta.name> · <last-4-of-run-id>` and
-closes it when the script finishes. Journal data lives in the plugin state
-directory Herdr manages.
+closes it when the script finishes, unless a call set `cleanup: false` to
+leave its tab (and the workspace) open for inspection. Journal data lives in
+the plugin state directory Herdr manages.
 
 ## Claude's Workflow tool vs this CLI
 
@@ -184,11 +196,15 @@ The runtime implements Claude Code's Workflow dialect:
   `completenessCheck`, `retry`, `gate`, and `checkpoint`
 - Pi options: `tier`, `timeoutMs`, and `retries`
 
-The plugin adds two options:
+The plugin adds three options:
 
-- `kind` selects the coding-agent CLI, such as `codex`, `claude`, or `pi`.
+- `kind` selects the coding-agent CLI. Any
+  [agent Herdr can drive](https://herdr.dev/docs/agents/#supported-agents)
+  works, such as `codex`, `claude`, `cursor`, or `pi`.
 - `ssh` selects a computer: a name that already works with `ssh` in your
   terminal. Omit it and the call runs here.
+- `cleanup` (default `true`). Set it `false` on a call to leave that tab,
+  and its workspace, open past run-end instead of trusting the return value.
 
 The runtime rejects options it cannot resolve. It does not silently ignore
 them.
@@ -233,8 +249,9 @@ Agents write results to `$HERDR_FLOW_OUT`; the runner validates that file and
 uses Herdr's agent status to track completion.
 
 The current release supports local and SSH workers, schema-checked output,
-journal replay, blocked-agent policies, and local worktree isolation. Worktree
-isolation over ssh and detached runs are not implemented yet.
+journal replay, blocked-agent policies, local worktree isolation, and a
+per-call `cleanup` override for keeping a tab open. Worktree isolation over
+ssh and detached runs are not implemented yet.
 
 ## Development
 

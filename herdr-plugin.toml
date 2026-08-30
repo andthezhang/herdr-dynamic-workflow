@@ -14,11 +14,11 @@ command = ["npm", "run", "build"]
 
 # Puts herdr-dynamic-workflow next to the herdr binary so any terminal can run it.
 [[build]]
-command = ["sh", "scripts/install-cli.sh"]
+command = ["node", "scripts/install-cli.mjs"]
 
 # Copy the authoring skill into agent clients detected by the skills CLI.
 [[build]]
-command = ["sh", "scripts/install-skill.sh"]
+command = ["node", "scripts/install-skill.mjs"]
 
 # herdr plugin action invoke cannot pass the JSON object on Herdr 0.8.x.
 # Use: herdr-dynamic-workflow <<'JSON'

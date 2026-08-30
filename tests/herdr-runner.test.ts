@@ -927,6 +927,59 @@ test("keepWorkspace leaves tabs and the workspace open after close()", async () 
   }
 });
 
+test("a call's own cleanup:false leaves its tab open and keeps the workspace alive after close()", async () => {
+  const harness = await startHarness();
+  const { server } = harness;
+  server.on("agent.prompt", writesResult("kept"));
+  try {
+    assert.equal(await harness.runner.run("review", { label: "reviewer", cleanup: false }), "kept");
+    assert.equal(server.callsFor("tab.close").length, 0, "cleanup:false must not close this call's tab");
+    await harness.runner.close();
+    assert.equal(
+      server.callsFor("workspace.close").length,
+      0,
+      "a preserved tab must keep its destination's workspace alive too",
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("cleanup:false on one call does not protect a sibling call's tab", async () => {
+  const harness = await startHarness();
+  const { server } = harness;
+  server.on("agent.prompt", writesResult("done"));
+  try {
+    await harness.runner.run("keep me", { label: "kept", cleanup: false });
+    await harness.runner.run("clean me", { label: "swept" });
+    assert.equal(server.callsFor("tab.close").length, 1, "only the call without cleanup:false closes its tab");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("cleanup:false still closes the tab when the call is aborted", async () => {
+  const harness = await startHarness();
+  const { server } = harness;
+  server.on("agent.prompt", () => new Promise(() => {}));
+  const controller = new AbortController();
+  try {
+    const pending = harness.runner.run("long task", { label: "worker", cleanup: false, signal: controller.signal });
+    while (server.callsFor("agent.prompt").length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    controller.abort();
+    await assert.rejects(pending, (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+      return true;
+    });
+    assert.equal(server.callsFor("tab.close").length, 1, "abort still frees the cancelled tab despite cleanup:false");
+  } finally {
+    await harness.close();
+  }
+});
+
 test("keepWorkspace still closes the tab when the call is aborted", async () => {
   const harness = await startHarness({ keepWorkspace: true });
   const { server } = harness;
